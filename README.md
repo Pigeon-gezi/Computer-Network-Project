@@ -23,7 +23,7 @@
 
 ## 项目架构
 
-```
+```bash
 project/
 ├── README.md
 ├── requirements.txt                  # Python 依赖
