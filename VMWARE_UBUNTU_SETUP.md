@@ -222,7 +222,57 @@ python3 scripts/extract_features.py \
   -o data/processed/features.csv
 ```
 
-## 9. 训练和检测
+## 9. 标注采集样本
+
+抓包完成后，可以用脚本自动统计 pcap 中的数据帧源 MAC，并追加标签到 `data/labels.csv`：
+
+```bash
+python3 scripts/label_capture.py \
+  -p data/raw/wireless_camera_001.pcap \
+  -d wireless_camera \
+  -n "phone hotspot camera live view"
+```
+
+脚本会列出候选源 MAC，例如：
+
+```text
+  1. aa:bb:cc:dd:ee:ff    30000 frames
+  2. 11:22:33:44:55:66     8000 frames
+```
+
+输入序号即可写入：
+
+```text
+data/labels.csv
+```
+
+如果已经知道目标 MAC：
+
+```bash
+python3 scripts/label_capture.py \
+  -p data/raw/wireless_camera_001.pcap \
+  -d wireless_camera \
+  -m aa:bb:cc:dd:ee:ff \
+  -n "known camera mac"
+```
+
+如果确认候选第一名就是目标设备，可以自动选择第一名：
+
+```bash
+python3 scripts/label_capture.py \
+  -p data/raw/wireless_camera_001.pcap \
+  -d wireless_camera \
+  -y \
+  -n "auto select top source mac"
+```
+
+默认 `session_id` 会使用 pcap 文件名去掉扩展名。例如：
+
+```text
+data/raw/wireless_camera_001.pcap -> session_id = wireless_camera_001
+```
+
+## 10. 训练和检测
 
 训练多分类模型：
 
@@ -249,7 +299,7 @@ python3 scripts/run_detector.py \
   -m data/models
 ```
 
-## 10. 恢复普通联网
+## 11. 恢复普通联网
 
 运行 `airmon-ng check kill` 或切换 monitor mode 后，Ubuntu 虚拟机里的普通 WiFi/网络管理服务可能被停止。需要恢复时：
 
@@ -262,7 +312,7 @@ sudo systemctl restart NetworkManager
 
 如果仍不恢复，直接重启虚拟机通常最快。
 
-## 11. 常见问题
+## 12. 常见问题
 
 查看网卡是否进入虚拟机：
 
