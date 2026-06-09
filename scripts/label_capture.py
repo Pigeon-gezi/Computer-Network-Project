@@ -14,6 +14,7 @@ DEVICE_TYPES = [
     'wireless_camera',
     'smartphone',
     'laptop',
+    'tablet',
     'iot_sensor',
     'access_point',
     'smart_speaker',
@@ -145,4 +146,3 @@ def normalize_mac(value):
 
 if __name__ == '__main__':
     main()
-
