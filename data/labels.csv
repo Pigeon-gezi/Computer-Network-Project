@@ -1,0 +1,3 @@
+device_mac,device_type,session_id,notes,timestamp
+94:ff:7d:95:7f:d5,wireless_camera,wireless_camera_001,phone hotspot camera video,2026-06-10T00:06:00
+5a:b0:67:24:26:e1,tablet,tablet_001,known camera mac,2026-06-10T01:13:26
