@@ -34,6 +34,8 @@ def main():
                         help='Train binary camera-vs-all classifier')
     parser.add_argument('--test-size', type=float, default=0.3,
                         help='Test set fraction')
+    parser.add_argument('--random-state', type=int, default=42,
+                        help='Random seed for train/test split')
     parser.add_argument('--cv', type=int, default=5,
                         help='Cross-validation folds')
     args = parser.parse_args()
@@ -53,6 +55,7 @@ def main():
     X, y = dataset.prepare()
     X_train, X_test, y_train, y_test = dataset.split(
         test_size=args.test_size,
+        random_state=args.random_state,
         stratify=(len(set(y)) > 1),
         fit_scaler_on_train=True,
     )

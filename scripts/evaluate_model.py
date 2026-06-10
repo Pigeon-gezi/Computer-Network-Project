@@ -17,8 +17,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 
-from src.ml.dataset import Dataset
 from src.ml.model_persistence import load_model, save_results
 from src.ml.model_evaluator import (
     evaluate_model, evaluate_binary_detection, cross_validate_model, print_evaluation
@@ -61,6 +61,10 @@ def main():
                         help='Output directory for figures')
     parser.add_argument('--label-col', default='device_type',
                         help='Label column name')
+    parser.add_argument('--test-size', type=float, default=0.3,
+                        help='Test set fraction used during training')
+    parser.add_argument('--random-state', type=int, default=42,
+                        help='Random seed used during train/test split')
     parser.add_argument('--cv', type=int, default=5, help='CV folds')
     parser.add_argument('--binary', action='store_true',
                         help='Evaluate as binary camera detector')
@@ -79,15 +83,15 @@ def main():
     print(f"[*] Model: {metadata.get('model_type', 'unknown')}")
     print(f"    Model classes: {model_label_names}")
 
-    dataset = Dataset(df, label_col=args.label_col)
-    _, y = dataset.prepare()
-    class_names = dataset.get_class_names()
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(df[args.label_col].values)
+    class_names = label_encoder.classes_.tolist()
 
     X_raw = _build_feature_matrix(df, model_feature_names)
     _, X_test_raw, _, y_test = train_test_split(
         X_raw, y,
-        test_size=0.3,
-        random_state=42,
+        test_size=args.test_size,
+        random_state=args.random_state,
         stratify=y if len(set(y)) > 1 else None,
     )
     X_test_scaled = scaler.transform(X_test_raw)
