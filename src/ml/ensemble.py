@@ -7,6 +7,28 @@ from .svm_classifier import train_svm
 from .rf_classifier import train_random_forest
 
 
+class WeightedSoftVotingClassifier:
+    """Soft-voting wrapper for already-fitted estimators."""
+
+    def __init__(self, estimators, weights):
+        self.estimators = estimators
+        self.weights = np.asarray(weights, dtype=float)
+        self.classes_ = estimators[0][1].classes_
+
+    def predict_proba(self, X):
+        weighted_probs = None
+        for weight, (_, model) in zip(self.weights, self.estimators):
+            if not np.array_equal(model.classes_, self.classes_):
+                raise ValueError("All estimators must use the same class order")
+            probs = model.predict_proba(X) * weight
+            weighted_probs = probs if weighted_probs is None else weighted_probs + probs
+        return weighted_probs / self.weights.sum()
+
+    def predict(self, X):
+        probabilities = self.predict_proba(X)
+        return self.classes_[np.argmax(probabilities, axis=1)]
+
+
 def build_ensemble(svm_model=None, rf_model=None, X_train=None, y_train=None,
                    cv=5, n_jobs=-1):
     """Build a VotingClassifier ensemble of SVM + Random Forest.
@@ -54,11 +76,10 @@ def build_weighted_ensemble(svm_model, rf_model, X_val, y_val,
 
     for w_svm in range(1, 6):
         for w_rf in range(1, 6):
-            ensemble = VotingClassifier(
+            ensemble = WeightedSoftVotingClassifier(
                 estimators=[('svm', svm_model), ('rf', rf_model)],
-                voting='soft', weights=[w_svm, w_rf],
+                weights=[w_svm, w_rf],
             )
-            ensemble.fit(X_val[:1], y_val[:1])  # Dummy fit; models are pre-trained
             y_pred = ensemble.predict(X_val)
             score = metric_fn(y_val, y_pred)
             if score > best_score:

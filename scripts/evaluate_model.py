@@ -16,6 +16,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
 
 from src.ml.dataset import Dataset
 from src.ml.model_persistence import load_model, save_results
@@ -30,6 +31,25 @@ from src.visualization.result_plots import (
 from src.visualization.feature_plots import (
     plot_correlation_heatmap, plot_pca_scatter, plot_feature_importance
 )
+
+
+def _build_feature_matrix(df, feature_names):
+    X_df = df[[c for c in feature_names if c in df.columns]].copy()
+    missing = set(feature_names) - set(X_df.columns)
+    for col in missing:
+        X_df[col] = 0
+    X_df = X_df[feature_names]
+    X_df = X_df.fillna(X_df.median(numeric_only=True))
+    X_df = X_df.fillna(0)
+    X_df = X_df.replace([np.inf, -np.inf], 0)
+    return X_df.values
+
+
+def _find_camera_class_index(class_names):
+    for i, name in enumerate(class_names):
+        if 'camera' in name.lower():
+            return i
+    return 0
 
 
 def main():
@@ -51,27 +71,50 @@ def main():
     # Load data
     print(f"[*] Loading {args.features}")
     df = pd.read_csv(args.features)
-    dataset = Dataset(df, label_col=args.label_col)
-    X, y = dataset.prepare()
-    class_names = dataset.get_class_names()
-    _, X_test, _, y_test = dataset.split(test_size=0.3)
 
-    print(f"    Samples: {len(df)}, Features: {X.shape[1]}")
-    print(f"    Classes: {class_names}")
-
-    # Load model
-    model, scaler, metadata = load_model(args.model)
+    model_name = 'camera_detector' if args.binary else 'device_classifier'
+    model, scaler, metadata = load_model(args.model, model_name)
+    model_feature_names = metadata['feature_names']
+    model_label_names = metadata['label_names']
     print(f"[*] Model: {metadata.get('model_type', 'unknown')}")
+    print(f"    Model classes: {model_label_names}")
 
-    X_test_scaled = scaler.transform(X_test)
+    dataset = Dataset(df, label_col=args.label_col)
+    _, y = dataset.prepare()
+    class_names = dataset.get_class_names()
+
+    X_raw = _build_feature_matrix(df, model_feature_names)
+    _, X_test_raw, _, y_test = train_test_split(
+        X_raw, y,
+        test_size=0.3,
+        random_state=42,
+        stratify=y if len(set(y)) > 1 else None,
+    )
+    X_test_scaled = scaler.transform(X_test_raw)
+
+    print(f"    Samples: {len(df)}, Features: {X_raw.shape[1]}")
+    print(f"    Dataset classes: {class_names}")
 
     # Evaluate
-    results = evaluate_model(model, X_test_scaled, y_test, class_names)
-    print_evaluation(results, class_names)
+    y_for_report = y_test
+    report_class_names = class_names
+    if args.binary:
+        camera_idx = _find_camera_class_index(class_names)
+        y_for_report = (y_test == camera_idx).astype(int)
+        report_class_names = model_label_names
+
+    results = evaluate_model(model, X_test_scaled, y_for_report,
+                             report_class_names)
+    print_evaluation(results, report_class_names)
 
     # Cross-validation
     print("\n[*] Cross-validation...")
-    cv_scores = cross_validate_model(model, X, y, cv=args.cv)
+    cv_y = y
+    if args.binary:
+        camera_idx = _find_camera_class_index(class_names)
+        cv_y = (y == camera_idx).astype(int)
+    X_scaled_for_cv = scaler.transform(X_raw)
+    cv_scores = cross_validate_model(model, X_scaled_for_cv, cv_y, cv=args.cv)
     for metric in ['test_accuracy', 'test_f1_macro', 'test_f1_weighted']:
         if metric in cv_scores:
             vals = cv_scores[metric]
@@ -82,14 +125,14 @@ def main():
 
     # Confusion matrix
     fig = plot_confusion_matrix(
-        results['confusion_matrix'], class_names,
+        results['confusion_matrix'], report_class_names,
         save_path=os.path.join(args.output, 'confusion_matrix.png'))
     plt.close(fig)
     print("    confusion_matrix.png")
 
     # Normalized confusion matrix
     fig = plot_confusion_matrix(
-        results['confusion_matrix'], class_names, normalize=True,
+        results['confusion_matrix'], report_class_names, normalize=True,
         save_path=os.path.join(args.output, 'confusion_matrix_norm.png'))
     plt.close(fig)
     print("    confusion_matrix_norm.png")
@@ -103,7 +146,7 @@ def main():
         print("    roc_curves.png")
 
     # Feature importance
-    imp_df = rank_features_by_importance(X, y, dataset.feature_names)
+    imp_df = rank_features_by_importance(X_raw, cv_y, model_feature_names)
     fig = plot_feature_importance(
         imp_df, top_n=20,
         save_path=os.path.join(args.output, 'feature_importance.png'))
@@ -121,22 +164,24 @@ def main():
 
     # PCA
     from src.features.feature_selector import apply_pca
-    X_pca, pca_model, evr = apply_pca(X, n_components=2)
+    X_pca, pca_model, evr = apply_pca(X_scaled_for_cv, n_components=2)
     fig = plot_pca_scatter(
-        X_pca, y, class_names,
+        X_pca, cv_y, report_class_names,
         save_path=os.path.join(args.output, 'pca_scatter.png'))
     plt.close(fig)
     print(f"    pca_scatter.png (explained variance: {evr[0]:.2%}, {evr[1]:.2%})")
 
     # Binary detection
     if args.binary or len(class_names) == 2:
-        camera_idx = 0
-        for i, name in enumerate(class_names):
-            if 'camera' in name.lower():
-                camera_idx = i
-                break
+        camera_idx = _find_camera_class_index(class_names)
+        if args.binary:
+            y_det = (y_test == camera_idx).astype(int)
+            positive_label = 1
+        else:
+            y_det = y_test
+            positive_label = camera_idx
         det_results = evaluate_binary_detection(
-            model, X_test_scaled, y_test, positive_label=camera_idx)
+            model, X_test_scaled, y_det, positive_label=positive_label)
         fig = plot_camera_detection_summary(
             det_results,
             save_path=os.path.join(args.output, 'camera_detection.png'))

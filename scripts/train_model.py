@@ -52,7 +52,10 @@ def main():
     dataset = Dataset(df, label_col=args.label_col)
     X, y = dataset.prepare()
     X_train, X_test, y_train, y_test = dataset.split(
-        test_size=args.test_size, stratify=(len(set(y)) > 1))
+        test_size=args.test_size,
+        stratify=(len(set(y)) > 1),
+        fit_scaler_on_train=True,
+    )
 
     class_names = dataset.get_class_names()
     print(f"\nClasses: {class_names}")

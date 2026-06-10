@@ -89,8 +89,11 @@ def cross_validate_model(model, X, y, cv=5, scoring=None):
     return scores
 
 
-def evaluate_binary_detection(model, X_test, y_test, positive_label=0):
+def evaluate_binary_detection(model, X_test, y_test, positive_label=1):
     """Evaluate for binary 'camera detection' scenario.
+
+    By convention, binary detectors encode the target/positive class as 1
+    and the background/negative class as 0.
 
     Reports detection-specific metrics useful for the camera detection use case.
     """
@@ -100,7 +103,8 @@ def evaluate_binary_detection(model, X_test, y_test, positive_label=0):
     y_true_bin = (y_test == positive_label).astype(int)
     y_pred_bin = (y_pred == positive_label).astype(int)
 
-    tn, fp, fn, tp = confusion_matrix(y_true_bin, y_pred_bin).ravel()
+    tn, fp, fn, tp = confusion_matrix(
+        y_true_bin, y_pred_bin, labels=[0, 1]).ravel()
 
     results = {
         'true_positive': int(tp),
@@ -115,7 +119,12 @@ def evaluate_binary_detection(model, X_test, y_test, positive_label=0):
 
     # PR curve
     try:
-        y_prob = model.predict_proba(X_test)[:, positive_label]
+        classes = getattr(model, 'classes_', None)
+        if classes is not None:
+            prob_idx = list(classes).index(positive_label)
+        else:
+            prob_idx = positive_label
+        y_prob = model.predict_proba(X_test)[:, prob_idx]
         precision_curve, recall_curve, _ = precision_recall_curve(
             y_true_bin, y_prob)
         results['pr_curve'] = {

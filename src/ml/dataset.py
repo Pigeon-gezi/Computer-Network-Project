@@ -15,6 +15,7 @@ class Dataset:
         self.scaler = StandardScaler()
         self.label_encoder = LabelEncoder()
         self.feature_names = None
+        self.X_raw = None
         self.X_scaled = None
         self.y_encoded = None
 
@@ -42,6 +43,7 @@ class Dataset:
 
         self.feature_names = X_df.columns.tolist()
         X = X_df.values
+        self.X_raw = X
 
         # Scale
         self.X_scaled = self.scaler.fit_transform(X)
@@ -52,12 +54,29 @@ class Dataset:
 
         return self.X_scaled, self.y_encoded
 
-    def split(self, test_size=0.3, random_state=42, stratify=True):
+    def split(self, test_size=0.3, random_state=42, stratify=True,
+              fit_scaler_on_train=False):
         """Split into train/test sets. Returns X_train, X_test, y_train, y_test."""
         if self.X_scaled is None:
             self.prepare()
 
         stratify_labels = self.y_encoded if stratify else None
+        if fit_scaler_on_train:
+            X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+                self.X_raw, self.y_encoded,
+                test_size=test_size,
+                random_state=random_state,
+                stratify=stratify_labels
+            )
+            self.scaler.fit(X_train_raw)
+            self.X_scaled = self.scaler.transform(self.X_raw)
+            return (
+                self.scaler.transform(X_train_raw),
+                self.scaler.transform(X_test_raw),
+                y_train,
+                y_test,
+            )
+
         return train_test_split(
             self.X_scaled, self.y_encoded,
             test_size=test_size,
