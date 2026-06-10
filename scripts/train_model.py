@@ -186,9 +186,12 @@ def _train_binary_mode(X_train, y_train, X_test, y_test,
     print("CAMERA DETECTION RESULTS")
     print("=" * 60)
 
-    svm_det = evaluate_binary_detection(svm_model, X_test, y_test_bin)
-    rf_det = evaluate_binary_detection(rf_model, X_test, y_test_bin)
-    ens_det = evaluate_binary_detection(ensemble, X_test, y_test_bin)
+    svm_det = evaluate_binary_detection(svm_model, X_test, y_test_bin,
+                                        positive_label=1)
+    rf_det = evaluate_binary_detection(rf_model, X_test, y_test_bin,
+                                       positive_label=1)
+    ens_det = evaluate_binary_detection(ensemble, X_test, y_test_bin,
+                                        positive_label=1)
 
     for name, det in [('SVM', svm_det), ('RF', rf_det), ('Ensemble', ens_det)]:
         print(f"\n{name}:")
