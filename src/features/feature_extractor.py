@@ -3,7 +3,9 @@
 import os
 import numpy as np
 import pandas as pd
-from .per_frame_features import extract_per_frame_features, extract_frame_batch
+from tqdm import tqdm
+
+from .per_frame_features import extract_per_frame_features
 from .per_flow_features import group_frames_into_flows, extract_flow_features
 from .burst_detector import detect_bursts, compute_burst_statistics
 from ..parser.pcap_reader import PcapReader
@@ -18,29 +20,35 @@ class FeatureExtractor:
     """
 
     def __init__(self, window_duration_sec=10.0, flow_timeout_sec=5.0,
-                 burst_iat_threshold_ms=1.0, min_burst_packets=3):
+                 burst_iat_threshold_ms=1.0, min_burst_packets=3,
+                 show_progress=False):
         self.window_duration = window_duration_sec
         self.flow_timeout = flow_timeout_sec
         self.burst_iat_threshold = burst_iat_threshold_ms
         self.min_burst_packets = min_burst_packets
+        self.show_progress = show_progress
 
-    def extract_from_pcap(self, pcap_path, max_frames=None):
+    def extract_from_pcap(self, pcap_path, max_frames=None, show_progress=None):
         """Full pipeline: pcap file -> per-flow feature DataFrame.
 
         Returns DataFrame where each row is one flow (SA->DA).
         """
+        progress = self.show_progress if show_progress is None else show_progress
+        pcap_name = os.path.basename(pcap_path)
+
         # Step 1: Parse pcap -> per-frame features
-        reader = PcapReader()
-        all_frames = list(reader.read_pcap(pcap_path))
-        if max_frames:
-            all_frames = all_frames[:max_frames]
+        all_frames = self._read_frames(pcap_path, max_frames=max_frames,
+                                       show_progress=progress,
+                                       desc=f"Reading {pcap_name}")
 
         if not all_frames:
             return pd.DataFrame()
 
         # Step 2: Extract per-frame features
         frame_features = []
-        for fi in all_frames:
+        frame_iter = tqdm(all_frames, desc=f"Frame features {pcap_name}",
+                          unit='frame', disable=not progress)
+        for fi in frame_iter:
             feats = extract_per_frame_features(fi)
             feats['sa'] = fi.sa or 'unknown'
             feats['da'] = fi.da or 'unknown'
@@ -51,7 +59,9 @@ class FeatureExtractor:
 
         # Step 4: Extract per-flow features + burst stats
         all_flow_features = []
-        for flow_frames in flows:
+        flow_iter = tqdm(flows, desc=f"Flow features {pcap_name}",
+                         unit='flow', disable=not progress)
+        for flow_frames in flow_iter:
             flow_feats = extract_flow_features(flow_frames)
 
             # Sort by timestamp for burst detection
@@ -73,7 +83,8 @@ class FeatureExtractor:
 
         return df
 
-    def extract_from_pcap_batch(self, pcap_dir, label_map=None):
+    def extract_from_pcap_batch(self, pcap_dir, label_map=None, max_frames=None,
+                                show_progress=None):
         """Extract features from all pcap files in a directory.
 
         Args:
@@ -83,12 +94,18 @@ class FeatureExtractor:
 
         Returns DataFrame with device labels if label_map is provided.
         """
+        progress = self.show_progress if show_progress is None else show_progress
         all_dfs = []
-        for fname in sorted(os.listdir(pcap_dir)):
-            if not (fname.endswith('.pcap') or fname.endswith('.pcapng')):
-                continue
+        pcap_files = [
+            fname for fname in sorted(os.listdir(pcap_dir))
+            if fname.endswith(('.pcap', '.pcapng'))
+        ]
+        file_iter = tqdm(pcap_files, desc="PCAP files", unit='file',
+                         disable=not progress)
+        for fname in file_iter:
             path = os.path.join(pcap_dir, fname)
-            df = self.extract_from_pcap(path)
+            df = self.extract_from_pcap(path, max_frames=max_frames,
+                                        show_progress=progress)
             if df.empty:
                 continue
 
@@ -123,21 +140,25 @@ class FeatureExtractor:
         X = X.replace([np.inf, -np.inf], 0)
         return X
 
-    def extract_window_features(self, pcap_path, window_sec=None):
+    def extract_window_features(self, pcap_path, window_sec=None, show_progress=None):
         """Extract features per time window (for MAC-agnostic analysis).
 
         Returns DataFrame of window-level features.
         """
+        progress = self.show_progress if show_progress is None else show_progress
+        pcap_name = os.path.basename(pcap_path)
         if window_sec is None:
             window_sec = self.window_duration
 
-        reader = PcapReader()
-        all_frames = list(reader.read_pcap(pcap_path))
+        all_frames = self._read_frames(pcap_path, show_progress=progress,
+                                       desc=f"Reading windows {pcap_name}")
         if not all_frames:
             return pd.DataFrame()
 
         frame_features = []
-        for fi in all_frames:
+        frame_iter = tqdm(all_frames, desc=f"Window frame features {pcap_name}",
+                          unit='frame', disable=not progress)
+        for fi in frame_iter:
             feats = extract_per_frame_features(fi)
             feats['sa'] = fi.sa or 'unknown'
             feats['da'] = fi.da or 'unknown'
@@ -156,11 +177,26 @@ class FeatureExtractor:
             windows[win_idx].append(feats)
 
         window_rows = []
-        for win_idx, win_frames in sorted(windows.items()):
+        window_items = sorted(windows.items())
+        window_iter = tqdm(window_items, desc=f"Window features {pcap_name}",
+                           unit='window', disable=not progress)
+        for win_idx, win_frames in window_iter:
             row = _extract_window_features(win_frames, win_idx, t0, window_sec)
             window_rows.append(row)
 
         return pd.DataFrame(window_rows)
+
+    def _read_frames(self, pcap_path, max_frames=None, show_progress=False,
+                     desc="Reading frames"):
+        reader = PcapReader()
+        frames = []
+        frame_iter = tqdm(reader.read_pcap(pcap_path), desc=desc, unit='frame',
+                          disable=not show_progress)
+        for i, frame in enumerate(frame_iter):
+            if max_frames is not None and i >= max_frames:
+                break
+            frames.append(frame)
+        return frames
 
 
 def _extract_window_features(window_frames, win_idx, t0, window_sec):

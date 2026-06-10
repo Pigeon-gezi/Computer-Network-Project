@@ -33,18 +33,22 @@ def main():
                         help='Burst IAT threshold (ms)')
     parser.add_argument('--extract-windows', action='store_true',
                         help='Also extract window-level features')
+    parser.add_argument('--no-progress', action='store_true',
+                        help='Disable progress bars')
     args = parser.parse_args()
 
     extractor = FeatureExtractor(
         window_duration_sec=args.window,
         flow_timeout_sec=args.flow_timeout,
         burst_iat_threshold_ms=args.burst_threshold,
+        show_progress=not args.no_progress,
     )
 
     if args.input_dir:
         # Batch mode
         label_map = _load_labels(args.labels) if args.labels else None
-        df = extractor.extract_from_pcap_batch(args.input_dir, label_map)
+        df = extractor.extract_from_pcap_batch(
+            args.input_dir, label_map, max_frames=args.max_frames)
         if df.empty:
             print("No features extracted. Check pcap files and monitor mode.")
             sys.exit(1)
