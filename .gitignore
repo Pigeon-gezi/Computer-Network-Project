@@ -13,3 +13,5 @@ data/models/*
 *.pcapng
 *.joblib
 report/
+
+.vscode/
