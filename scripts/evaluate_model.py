@@ -65,6 +65,8 @@ def main():
                         help='Test set fraction used during training')
     parser.add_argument('--random-state', type=int, default=42,
                         help='Random seed used during train/test split')
+    parser.add_argument('--external-test', action='store_true',
+                        help='Use the whole feature CSV as a held-out test set')
     parser.add_argument('--cv', type=int, default=5, help='CV folds')
     parser.add_argument('--binary', action='store_true',
                         help='Evaluate as binary camera detector')
@@ -88,16 +90,25 @@ def main():
     class_names = label_encoder.classes_.tolist()
 
     X_raw = _build_feature_matrix(df, model_feature_names)
-    _, X_test_raw, _, y_test = train_test_split(
-        X_raw, y,
-        test_size=args.test_size,
-        random_state=args.random_state,
-        stratify=y if len(set(y)) > 1 else None,
-    )
+    if args.external_test:
+        X_test_raw = X_raw
+        y_test = y
+    else:
+        _, X_test_raw, _, y_test = train_test_split(
+            X_raw, y,
+            test_size=args.test_size,
+            random_state=args.random_state,
+            stratify=y if len(set(y)) > 1 else None,
+        )
     X_test_scaled = scaler.transform(X_test_raw)
 
     print(f"    Samples: {len(df)}, Features: {X_raw.shape[1]}")
     print(f"    Dataset classes: {class_names}")
+    if args.external_test:
+        print("    Evaluation mode: external test set (no split)")
+    else:
+        print(f"    Evaluation mode: split test_size={args.test_size}, "
+              f"random_state={args.random_state}")
 
     # Evaluate
     y_for_report = y_test
@@ -112,17 +123,20 @@ def main():
     print_evaluation(results, report_class_names)
 
     # Cross-validation
-    print("\n[*] Cross-validation...")
     cv_y = y
     if args.binary:
         camera_idx = _find_camera_class_index(class_names)
         cv_y = (y == camera_idx).astype(int)
     X_scaled_for_cv = scaler.transform(X_raw)
-    cv_scores = cross_validate_model(model, X_scaled_for_cv, cv_y, cv=args.cv)
-    for metric in ['test_accuracy', 'test_f1_macro', 'test_f1_weighted']:
-        if metric in cv_scores:
-            vals = cv_scores[metric]
-            print(f"    {metric}: {vals.mean():.4f} (+/- {vals.std():.4f})")
+    if args.external_test:
+        print("\n[*] Cross-validation skipped for external test set.")
+    else:
+        print("\n[*] Cross-validation...")
+        cv_scores = cross_validate_model(model, X_scaled_for_cv, cv_y, cv=args.cv)
+        for metric in ['test_accuracy', 'test_f1_macro', 'test_f1_weighted']:
+            if metric in cv_scores:
+                vals = cv_scores[metric]
+                print(f"    {metric}: {vals.mean():.4f} (+/- {vals.std():.4f})")
 
     # Generate figures
     print("\n[*] Generating figures...")
