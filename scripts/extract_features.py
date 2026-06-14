@@ -85,13 +85,14 @@ def _load_labels(labels_path):
         return None
 
     labels_df = pd.read_csv(labels_path)
-    label_map = {}
+    label_items = []
     for _, row in labels_df.iterrows():
         session = row.get('session_id', '')
         device = row.get('device_type', 'unknown')
         if session:
-            label_map[session] = device
-    return label_map
+            label_items.append((session, device))
+    label_items.sort(key=lambda item: len(item[0]), reverse=True)
+    return dict(label_items)
 
 
 if __name__ == '__main__':

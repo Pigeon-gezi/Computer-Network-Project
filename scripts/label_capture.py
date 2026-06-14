@@ -25,11 +25,13 @@ DEVICE_TYPES = [
 def main():
     parser = argparse.ArgumentParser(
         description='Inspect a pcap, choose a likely device MAC, and update labels.csv')
-    parser.add_argument('--pcap', '-p', required=True, help='Input pcap file')
+    parser.add_argument('--pcap', '-p', help='Input pcap file')
     parser.add_argument('--device', '-d', required=True, choices=DEVICE_TYPES,
                         help='Device type label')
     parser.add_argument('--session-id', '-s',
                         help='Session id. Defaults to pcap basename without extension')
+    parser.add_argument('--prefix',
+                        help='Append a prefix label without inspecting a pcap')
     parser.add_argument('--labels', '-l', default='data/labels.csv',
                         help='labels.csv path')
     parser.add_argument('--notes', '-n', default='', help='Notes for this capture')
@@ -42,6 +44,21 @@ def main():
     parser.add_argument('--dry-run', action='store_true',
                         help='Print the row but do not write labels.csv')
     args = parser.parse_args()
+
+    if args.prefix:
+        row = {
+            'device_mac': normalize_mac(args.mac or 'unknown'),
+            'device_type': args.device,
+            'session_id': args.prefix,
+            'notes': args.notes or 'prefix label',
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+        }
+        write_or_print_label(args.labels, row, args.dry_run)
+        return
+
+    if not args.pcap:
+        print("ERROR: --pcap is required unless --prefix is used.", file=sys.stderr)
+        sys.exit(1)
 
     if not os.path.exists(args.pcap):
         print(f"ERROR: pcap not found: {args.pcap}", file=sys.stderr)
@@ -63,15 +80,19 @@ def main():
         'timestamp': datetime.now().isoformat(timespec='seconds'),
     }
 
+    write_or_print_label(args.labels, row, args.dry_run)
+
+
+def write_or_print_label(labels_path, row, dry_run=False):
     print("\nLabel row:")
     print(','.join(row.values()))
 
-    if args.dry_run:
+    if dry_run:
         print("[*] Dry run: labels.csv not modified.")
         return
 
-    append_label(args.labels, row)
-    print(f"[*] Appended label to {args.labels}")
+    append_label(labels_path, row)
+    print(f"[*] Appended label to {labels_path}")
 
 
 def get_source_mac_counts(pcap_path):
