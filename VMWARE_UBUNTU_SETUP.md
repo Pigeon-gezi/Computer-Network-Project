@@ -340,6 +340,34 @@ python3 scripts/extract_features.py \
   -o data/processed/test_features.csv
 ```
 
+### 训练数据占比检查
+
+训练前建议检查类别、session 和 MAC 占比，避免某个设备或某个 pcap 贡献过多样本：
+
+```bash
+python3 - <<'PY'
+import pandas as pd
+
+df = pd.read_csv('data/processed/train_device_window_features.csv')
+
+print('\n[device_type]')
+print(df['device_type'].value_counts())
+print((df['device_type'].value_counts(normalize=True) * 100).round(2).astype(str) + '%')
+
+if 'source_file' in df.columns:
+    print('\n[source_file, device_type]')
+    print(df.groupby(['source_file', 'device_type']).size().sort_values(ascending=False))
+
+mac_col = 'device_mac' if 'device_mac' in df.columns else 'sa'
+if mac_col in df.columns:
+    print(f'\n[{mac_col}]')
+    print(df[mac_col].value_counts())
+    print((df[mac_col].value_counts(normalize=True) * 100).round(2).astype(str) + '%')
+PY
+```
+
+如果某个 MAC 或某个 `source_file` 占比过高，模型可能更容易学习该 session 的环境特征，而不是设备类别特征。正式实验建议让每类有多个 session，并尽量避免单个 session 占主导。
+
 ## 9. 标注采集样本
 
 抓包完成后，可以用脚本自动统计 pcap 中的数据帧源 MAC，并追加标签到 `data/labels.csv`：
