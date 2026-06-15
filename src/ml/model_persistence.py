@@ -75,5 +75,7 @@ def save_results(results, output_dir='data/processed/'):
 def export_predictions_csv(predictions, output_path='data/processed/predictions.csv'):
     """Export device predictions to CSV."""
     import pandas as pd
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     pd.DataFrame(predictions).to_csv(output_path, index=False)

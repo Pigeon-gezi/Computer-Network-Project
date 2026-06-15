@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Detect suspicious camera MACs from an unlabeled pcap.
+
+This is an inference/demo entry point. It does not require labels.csv.
+It ranks MAC addresses observed in one pcap, extracts MAC-level window
+features for each candidate, and aggregates model predictions per MAC.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+import numpy as np
+import pandas as pd
+
+from src.features.feature_extractor import FeatureExtractor
+from src.ml.model_persistence import load_model, export_predictions_csv
+
+
+MAC_RE = re.compile(r'^[0-9a-f]{2}(:[0-9a-f]{2}){5}$')
+HIGH_RISK_MODEL_FEATURES = {
+    'device_mac',
+    'device_oui',
+    'source_file',
+    'session_id',
+    'window_idx',
+    'window_start',
+    'time_start',
+    'is_known_camera_oui',
+    'camera_heuristic_score',
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Detect suspicious camera MACs from an unlabeled pcap')
+    parser.add_argument('--pcap', '-p', required=True, help='Input pcap file')
+    parser.add_argument('--model', '-m', default='data/models/',
+                        help='Model directory')
+    parser.add_argument('--model-name', default='camera_detector',
+                        help='Model name prefix in model directory')
+    parser.add_argument('--output', '-o',
+                        default='data/processed/unknown_detection_results.csv',
+                        help='Output CSV path')
+    parser.add_argument('--window', type=float, default=10.0,
+                        help='Device-window duration in seconds')
+    parser.add_argument('--top-macs', type=int, default=20,
+                        help='Number of top MACs to inspect; use 0 for all')
+    parser.add_argument('--min-frames', type=int, default=100,
+                        help='Minimum total observed frames for a candidate MAC')
+    parser.add_argument('--min-source-frames', type=int, default=10,
+                        help='Minimum source frames for a candidate MAC')
+    parser.add_argument('--camera-threshold', type=float, default=0.6,
+                        help='Mean camera probability threshold')
+    parser.add_argument('--window-ratio-threshold', type=float, default=0.5,
+                        help='Camera-window ratio threshold')
+    parser.add_argument('--max-frames', type=int,
+                        help='Max frames per MAC during feature extraction')
+    parser.add_argument('--no-progress', action='store_true',
+                        help='Disable progress bars')
+    args = parser.parse_args()
+
+    if not os.path.exists(args.pcap):
+        print(f"ERROR: pcap not found: {args.pcap}")
+        sys.exit(1)
+
+    model, scaler, metadata = load_model(args.model, args.model_name)
+    feature_names = metadata['feature_names']
+    label_names = metadata['label_names']
+
+    print(f"[*] Loaded model: {metadata.get('model_type', 'unknown')}")
+    print(f"    Model name: {args.model_name}")
+    print(f"    Classes: {label_names}")
+    print(f"    Features: {len(feature_names)}")
+    _warn_if_risky_features(feature_names)
+
+    print(f"\n[*] Enumerating MACs in {args.pcap}")
+    candidates = enumerate_macs(args.pcap)
+    if not candidates:
+        print("ERROR: no 802.11 MAC addresses found in pcap.")
+        sys.exit(1)
+
+    candidates = [
+        row for row in candidates
+        if row['total_frames'] >= args.min_frames
+        and row['source_frames'] >= args.min_source_frames
+    ]
+    if args.top_macs > 0:
+        candidates = candidates[:args.top_macs]
+
+    if not candidates:
+        print("No candidates passed the frame thresholds.")
+        print("Try lowering --min-frames or --min-source-frames.")
+        sys.exit(1)
+
+    print(f"    Candidates selected: {len(candidates)}")
+    for i, row in enumerate(candidates[:10], start=1):
+        print(f"    {i:2d}. {row['mac']}  total={row['total_frames']}  "
+              f"source={row['source_frames']}  data_source={row['data_source_frames']}")
+
+    extractor = FeatureExtractor(
+        window_duration_sec=args.window,
+        show_progress=not args.no_progress,
+    )
+
+    camera_label_idx = find_camera_label_index(label_names)
+    camera_prob_col = find_probability_column(model, camera_label_idx)
+
+    results = []
+    for i, candidate in enumerate(candidates, start=1):
+        mac = candidate['mac']
+        print(f"\n[*] [{i}/{len(candidates)}] Extracting device windows for {mac}")
+        df = extractor.extract_device_windows_from_pcap(
+            args.pcap,
+            target_mac=mac,
+            window_sec=args.window,
+            max_frames=args.max_frames,
+            show_progress=not args.no_progress,
+        )
+        summary = dict(candidate)
+        if df.empty:
+            summary.update({
+                'status': 'no_features',
+                'window_count': 0,
+                'predicted_type': 'unknown',
+                'camera_prob_mean': 0.0,
+                'camera_prob_max': 0.0,
+                'camera_window_ratio': 0.0,
+                'suspicious_camera': False,
+            })
+            results.append(summary)
+            print("    no device-window features")
+            continue
+
+        mac_summary = predict_and_aggregate(
+            df=df,
+            model=model,
+            scaler=scaler,
+            feature_names=feature_names,
+            label_names=label_names,
+            camera_label_idx=camera_label_idx,
+            camera_prob_col=camera_prob_col,
+            camera_threshold=args.camera_threshold,
+            window_ratio_threshold=args.window_ratio_threshold,
+        )
+        summary.update(mac_summary)
+        results.append(summary)
+
+        flag = "YES" if summary['suspicious_camera'] else "no"
+        print(f"    windows={summary['window_count']}  "
+              f"camera_prob_mean={summary['camera_prob_mean']:.3f}  "
+              f"camera_window_ratio={summary['camera_window_ratio']:.3f}  "
+              f"suspicious={flag}")
+
+    result_df = pd.DataFrame(results)
+    result_df = result_df.sort_values(
+        ['suspicious_camera', 'camera_prob_mean', 'camera_window_ratio',
+         'data_source_frames', 'total_frames'],
+        ascending=[False, False, False, False, False],
+    )
+
+    print_summary(result_df)
+    export_predictions_csv(result_df, args.output)
+    print(f"\n[*] Results saved to {args.output}")
+
+
+def enumerate_macs(pcap_path):
+    """Return MAC candidates ranked by data-source and total frame counts."""
+    fields = [
+        'wlan.sa',
+        'wlan.da',
+        'wlan.ta',
+        'wlan.ra',
+        'wlan.bssid',
+        'wlan.fc.type',
+    ]
+    cmd = [
+        'tshark',
+        '-r', pcap_path,
+        '-T', 'fields',
+        '-E', 'separator=/t',
+        '-E', 'occurrence=f',
+    ]
+    for field in fields:
+        cmd.extend(['-e', field])
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        print("ERROR: tshark not found. Install tshark or run inside the Ubuntu VM.")
+        sys.exit(1)
+
+    if proc.returncode != 0:
+        print(f"ERROR: tshark failed while enumerating MACs:\n{proc.stderr}")
+        sys.exit(1)
+
+    stats = defaultdict(lambda: {
+        'mac': '',
+        'total_frames': 0,
+        'source_frames': 0,
+        'dest_frames': 0,
+        'transmitter_frames': 0,
+        'receiver_frames': 0,
+        'bssid_frames': 0,
+        'data_frames': 0,
+        'data_source_frames': 0,
+    })
+
+    for line in proc.stdout.splitlines():
+        parts = line.rstrip('\n').split('\t')
+        if len(parts) < len(fields):
+            parts.extend([''] * (len(fields) - len(parts)))
+        sa, da, ta, ra, bssid, frame_type = parts[:len(fields)]
+        frame_type_i = parse_int(frame_type, default=-1)
+        is_data = frame_type_i == 2
+
+        addresses = [
+            ('source_frames', sa),
+            ('dest_frames', da),
+            ('transmitter_frames', ta),
+            ('receiver_frames', ra),
+            ('bssid_frames', bssid),
+        ]
+        seen_in_frame = set()
+        for key, raw_mac in addresses:
+            mac = normalize_mac(raw_mac)
+            if not is_candidate_mac(mac):
+                continue
+            stats[mac]['mac'] = mac
+            stats[mac][key] += 1
+            seen_in_frame.add(mac)
+            if is_data and key == 'source_frames':
+                stats[mac]['data_source_frames'] += 1
+
+        for mac in seen_in_frame:
+            stats[mac]['total_frames'] += 1
+            if is_data:
+                stats[mac]['data_frames'] += 1
+
+    rows = list(stats.values())
+    rows.sort(
+        key=lambda row: (
+            row['data_source_frames'],
+            row['source_frames'],
+            row['total_frames'],
+        ),
+        reverse=True,
+    )
+    return rows
+
+
+def predict_and_aggregate(df, model, scaler, feature_names, label_names,
+                          camera_label_idx, camera_prob_col,
+                          camera_threshold, window_ratio_threshold):
+    X_df = df[[c for c in feature_names if c in df.columns]].copy()
+    missing = set(feature_names) - set(X_df.columns)
+    for col in missing:
+        X_df[col] = 0
+    X_df = X_df[feature_names]
+    X_df = X_df.fillna(X_df.median(numeric_only=True))
+    X_df = X_df.fillna(0)
+    X_df = X_df.replace([np.inf, -np.inf], 0)
+
+    X_scaled = scaler.transform(X_df.values)
+    predictions = model.predict(X_scaled)
+    pred_labels = [label_for_prediction(p, label_names) for p in predictions]
+
+    camera_window_mask = np.array([
+        label_index_for_prediction(p, label_names) == camera_label_idx
+        for p in predictions
+    ])
+    camera_probs = None
+    if hasattr(model, 'predict_proba'):
+        probs = model.predict_proba(X_scaled)
+        if probs.ndim == 2 and probs.shape[1] > camera_prob_col:
+            camera_probs = probs[:, camera_prob_col]
+
+    if camera_probs is None:
+        camera_probs = camera_window_mask.astype(float)
+
+    camera_window_ratio = float(camera_window_mask.mean())
+    camera_prob_mean = float(np.mean(camera_probs))
+    camera_prob_max = float(np.max(camera_probs))
+    suspicious = (
+        camera_prob_mean >= camera_threshold
+        or camera_window_ratio >= window_ratio_threshold
+    )
+
+    summary = {
+        'status': 'ok',
+        'window_count': len(df),
+        'predicted_type': most_common(pred_labels),
+        'camera_prob_mean': camera_prob_mean,
+        'camera_prob_max': camera_prob_max,
+        'camera_window_ratio': camera_window_ratio,
+        'camera_pred_windows': int(camera_window_mask.sum()),
+        'suspicious_camera': suspicious,
+    }
+    summary.update(key_feature_means(df))
+    return summary
+
+
+def key_feature_means(df):
+    selected = [
+        'packet_count',
+        'total_bytes',
+        'throughput_bps',
+        'mean_frame_size',
+        'large_frame_ratio',
+        'uplink_packet_ratio',
+        'uplink_bytes_ratio',
+        'downlink_packet_ratio',
+        'qos_data_ratio',
+        'mean_data_rate',
+        'mean_rssi',
+        'burst_count',
+        'burst_density',
+    ]
+    output = {}
+    for col in selected:
+        if col in df.columns:
+            output[f'mean_{col}'] = float(pd.to_numeric(
+                df[col], errors='coerce').fillna(0).mean())
+    return output
+
+
+def print_summary(result_df):
+    print("\n" + "=" * 72)
+    print("UNKNOWN PCAP DETECTION SUMMARY")
+    print("=" * 72)
+
+    cols = [
+        'mac', 'total_frames', 'source_frames', 'data_source_frames',
+        'window_count', 'camera_prob_mean', 'camera_prob_max',
+        'camera_window_ratio', 'suspicious_camera',
+    ]
+    cols = [col for col in cols if col in result_df.columns]
+    print(result_df[cols].to_string(index=False))
+
+    suspicious = result_df[result_df['suspicious_camera'] == True]
+    if suspicious.empty:
+        print("\n[ ] No suspicious camera MACs above threshold.")
+        return
+
+    print("\n[!] Suspicious camera MACs:")
+    for _, row in suspicious.iterrows():
+        print(f"    {row['mac']}  prob_mean={row['camera_prob_mean']:.3f}  "
+              f"windows={int(row['window_count'])}/{int(row['camera_pred_windows'])}")
+
+
+def find_camera_label_index(label_names):
+    for i, name in enumerate(label_names):
+        lower = str(name).lower()
+        if 'camera' in lower and not lower.startswith('non_'):
+            return i
+    for i, name in enumerate(label_names):
+        if 'camera' in str(name).lower():
+            return i
+    return 0
+
+
+def find_probability_column(model, label_idx):
+    classes = getattr(model, 'classes_', None)
+    if classes is None and hasattr(model, 'named_steps'):
+        final_step = list(model.named_steps.values())[-1]
+        classes = getattr(final_step, 'classes_', None)
+    if classes is None:
+        return label_idx
+    for i, cls in enumerate(classes):
+        try:
+            if int(cls) == label_idx:
+                return i
+        except (TypeError, ValueError):
+            if str(cls) == str(label_idx):
+                return i
+    return min(label_idx, len(classes) - 1)
+
+
+def label_index_for_prediction(prediction, label_names):
+    try:
+        idx = int(prediction)
+    except (TypeError, ValueError):
+        return -1
+    if 0 <= idx < len(label_names):
+        return idx
+    return -1
+
+
+def label_for_prediction(prediction, label_names):
+    idx = label_index_for_prediction(prediction, label_names)
+    if idx >= 0:
+        return label_names[idx]
+    return str(prediction)
+
+
+def most_common(values):
+    counts = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    if not counts:
+        return 'unknown'
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
+def _warn_if_risky_features(feature_names):
+    risky = [name for name in feature_names if name in HIGH_RISK_MODEL_FEATURES]
+    if not risky:
+        return
+    print("\nWARNING: model metadata contains high-risk features:")
+    for name in risky:
+        print(f"    {name}")
+    print("Use a model retrained after excluding identity/time/heuristic features.")
+
+
+def normalize_mac(value):
+    return str(value or '').strip().lower().replace('-', ':')
+
+
+def is_candidate_mac(mac):
+    if not MAC_RE.match(mac):
+        return False
+    if mac in ('00:00:00:00:00:00', 'ff:ff:ff:ff:ff:ff'):
+        return False
+    first_octet = int(mac.split(':')[0], 16)
+    return (first_octet & 1) == 0
+
+
+def parse_int(value, default=0):
+    value = str(value).strip()
+    if not value:
+        return default
+    try:
+        return int(value, 0)
+    except ValueError:
+        try:
+            return int(float(value))
+        except ValueError:
+            return default
+
+
+if __name__ == '__main__':
+    main()

@@ -426,7 +426,7 @@ python3 scripts/label_capture.py \
 data/raw/wireless_camera_001.pcap -> session_id = wireless_camera_001
 ```
 
-## 10. 训练和检测
+## 10. 训练、评估和未知场景检测
 
 推荐训练二分类摄像头检测模型：
 
@@ -435,10 +435,11 @@ python3 scripts/train_model.py \
   -f data/processed/train_device_window_features.csv \
   -o data/models \
   --binary-camera \
-  --cv 2
+  --cv 2 \
+  --group-col source_file
 ```
 
-此时 `train_model.py` 内部会从训练集里再切出一部分作为 validation / internal test。
+此时 `train_model.py` 内部会从训练集里再切出一部分作为 validation / internal test。`--group-col source_file` 表示按 pcap 文件分组划分，避免同一份 pcap 的多个时间窗口同时进入训练集和内部测试集。
 
 使用独立测试集做最终评估：
 
@@ -453,13 +454,77 @@ python3 scripts/evaluate_model.py \
 
 `--external-test` 表示整份输入 CSV 都是 final held-out test，不再随机切分。
 
-运行检测：
+### 未知 pcap 检测模式
+
+正式演示时更常见的输入是一份未标注的现场 pcap。此时不应该依赖 `labels.csv`，而是让程序枚举 pcap 中出现的 MAC，逐个建立 device-window 画像，再用训练好的 `camera_detector` 判断哪些 MAC 疑似摄像头。
+
+推荐使用：
 
 ```bash
-python3 scripts/run_detector.py \
-  -p data/raw/test_capture.pcap \
-  -m data/models
+python3 scripts/detect_unknown_pcap.py \
+  -p data/raw/mixed_test/unknown_scene.pcap \
+  -m data/models \
+  --window 10 \
+  --top-macs 20 \
+  --min-frames 100 \
+  --min-source-frames 10 \
+  --camera-threshold 0.6 \
+  -o data/processed/unknown_scene_detection.csv
 ```
+
+该脚本会输出：
+
+```text
+1. pcap 中出现频率较高的候选 MAC
+2. 每个候选 MAC 的窗口数、帧数、摄像头概率
+3. 被判定为 suspicious_camera 的 MAC
+4. 关键指标均值，例如 large_frame_ratio、mean_frame_size、uplink_packet_ratio
+```
+
+参数含义：
+
+```text
+--top-macs 20
+    只检测候选排名前 20 的 MAC，避免复杂环境下运行过慢。
+    设置为 0 表示检测所有满足阈值的 MAC。
+
+--min-frames 100
+    候选 MAC 至少要在 100 个帧中出现过。
+    只要该 MAC 出现在 sa/da/ta/ra/bssid 任一地址字段中，就计入 total_frames。
+
+--min-source-frames 10
+    候选 MAC 至少要作为 wlan.sa 出现 10 次。
+    这不是严格的上行帧数，只是快速排除几乎不主动发送的 MAC。
+    真正的上行比例会在 device-window 特征中通过 uplink_packet_ratio 等字段计算。
+
+--camera-threshold 0.6
+    如果某个 MAC 的平均摄像头概率超过该阈值，则标记为 suspicious_camera。
+```
+
+如果抓包时间较短，候选 MAC 被过滤掉，可以适当放宽：
+
+```bash
+python3 scripts/detect_unknown_pcap.py \
+  -p data/raw/mixed_test/unknown_scene.pcap \
+  -m data/models \
+  --top-macs 0 \
+  --min-frames 30 \
+  --min-source-frames 5 \
+  -o data/processed/unknown_scene_detection.csv
+```
+
+如果现场 MAC 很多、运行太慢，可以提高阈值：
+
+```bash
+python3 scripts/detect_unknown_pcap.py \
+  -p data/raw/mixed_test/unknown_scene.pcap \
+  -m data/models \
+  --top-macs 10 \
+  --min-frames 500 \
+  --min-source-frames 50
+```
+
+`scripts/run_detector.py` 是旧的通用预测脚本，主要用于对已提取的 feature CSV 或 flow-level pcap 做分类。当前正式演示推荐使用 `scripts/detect_unknown_pcap.py`，因为它针对未标注 pcap 自动枚举 MAC，并按 MAC 聚合输出候选摄像头。
 
 ## 11. 恢复普通联网
 
