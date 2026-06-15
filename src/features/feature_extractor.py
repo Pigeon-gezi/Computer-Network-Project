@@ -1,6 +1,7 @@
 """Central feature extraction orchestrator: pcap -> per-flow feature DataFrame."""
 
 import os
+import subprocess
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -128,9 +129,13 @@ class FeatureExtractor:
         if window_sec is None:
             window_sec = self.window_duration
 
-        frame_features = self._extract_frame_features_from_pcap(
-            pcap_path, max_frames=max_frames, show_progress=progress,
-            desc_name=pcap_name)
+        frame_features = self._extract_frame_features_fast_tshark(
+            pcap_path, target_mac=target_mac, max_frames=max_frames,
+            show_progress=progress, desc_name=pcap_name)
+        if frame_features is None:
+            frame_features = self._extract_frame_features_from_pcap(
+                pcap_path, max_frames=max_frames, show_progress=progress,
+                desc_name=pcap_name)
         if not frame_features:
             return pd.DataFrame()
 
@@ -270,6 +275,88 @@ class FeatureExtractor:
             frame_features.append(feats)
         return frame_features
 
+    def _extract_frame_features_fast_tshark(self, pcap_path, target_mac,
+                                            max_frames=None,
+                                            show_progress=False,
+                                            desc_name=None):
+        """Fast frame reader for device-window mode using tshark fields."""
+        pcap_name = desc_name or os.path.basename(pcap_path)
+        fields = [
+            'frame.time_epoch',
+            'frame.len',
+            'radiotap.dbm_antsignal',
+            'radiotap.datarate',
+            'radiotap.channel.freq',
+            'radiotap.mcs.index',
+            'radiotap.dbm_antnoise',
+            'wlan.fc.type',
+            'wlan.fc.type_subtype',
+            'wlan.fc.tods',
+            'wlan.fc.fromds',
+            'wlan.sa',
+            'wlan.da',
+            'wlan.seq',
+            'wlan.duration',
+            'wlan.fc.retry',
+            'wlan.fc.protected',
+            'wlan.qos.priority',
+        ]
+        cmd = [
+            'tshark',
+            '-r', pcap_path,
+            '-Y', f'wlan.addr == {target_mac}',
+            '-T', 'fields',
+            '-E', 'separator=/t',
+            '-E', 'occurrence=f',
+        ]
+        for field in fields:
+            cmd.extend(['-e', field])
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            print("WARNING: tshark not found; falling back to PyShark reader")
+            return None
+
+        frame_features = []
+        terminated_early = False
+        progress_iter = tqdm(
+            process.stdout,
+            desc=f"Fast fields {pcap_name}",
+            unit='frame',
+            disable=not show_progress,
+        )
+        try:
+            for i, line in enumerate(progress_iter):
+                if max_frames is not None and i >= max_frames:
+                    terminated_early = True
+                    process.terminate()
+                    break
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < len(fields):
+                    parts.extend([''] * (len(fields) - len(parts)))
+                feats = _tshark_fields_to_frame_features(parts)
+                if feats is not None:
+                    frame_features.append(feats)
+        finally:
+            if process.stdout:
+                process.stdout.close()
+
+        stderr = process.stderr.read() if process.stderr else ''
+        returncode = process.wait()
+        if returncode != 0 and not terminated_early:
+            print(f"WARNING: fast tshark reader failed for {pcap_name}: "
+                  f"{stderr.strip()}")
+            return None
+
+        return frame_features
+
 
 def _extract_window_features(window_frames, win_idx, t0, window_sec):
     """Extract aggregate features for a single time window."""
@@ -331,6 +418,75 @@ def _extract_window_features(window_frames, win_idx, t0, window_sec):
                             if f.get('is_qos_data', 0) == 1) / n
 
     return row
+
+
+def _tshark_fields_to_frame_features(parts):
+    (timestamp, frame_len, rssi, data_rate, channel_freq, mcs_index,
+     ant_noise, frame_type, frame_subtype, to_ds, from_ds, sa, da, seq_num,
+     duration, retry, protected, qos_priority) = parts
+
+    ts = _parse_float(timestamp, default=None)
+    length = _parse_int(frame_len, default=None)
+    if ts is None or length is None:
+        return None
+
+    frame_type_i = _parse_int(frame_type, default=-1)
+    frame_subtype_i = _parse_int(frame_subtype, default=-1)
+    to_ds_i = _parse_int(to_ds, default=0)
+    from_ds_i = _parse_int(from_ds, default=0)
+    retry_i = _parse_int(retry, default=0)
+    protected_i = _parse_int(protected, default=0)
+    channel_i = _parse_int(channel_freq, default=0)
+
+    return {
+        'timestamp': ts,
+        'frame_len': length,
+        'rssi': _parse_float(rssi, default=np.nan),
+        'data_rate': _parse_float(data_rate, default=0.0),
+        'channel_freq': channel_i,
+        'mcs_index': _parse_int(mcs_index, default=-1),
+        'ant_noise': _parse_float(ant_noise, default=np.nan),
+        'frame_type': frame_type_i,
+        'frame_subtype': frame_subtype_i,
+        'to_ds': to_ds_i,
+        'from_ds': from_ds_i,
+        'seq_num': _parse_int(seq_num, default=-1),
+        'duration': _parse_int(duration, default=0),
+        'retry_flag': retry_i,
+        'protected_flag': protected_i,
+        'qos_priority': _parse_int(qos_priority, default=-1),
+        'is_data': 1 if frame_type_i == 2 else 0,
+        'is_mgmt': 1 if frame_type_i == 0 else 0,
+        'is_ctrl': 1 if frame_type_i == 1 else 0,
+        'is_qos_data': 1 if frame_type_i == 2 and frame_subtype_i == 0x28 else 0,
+        'is_uplink': 1 if to_ds_i == 1 and from_ds_i == 0 else 0,
+        'is_5ghz': 1 if channel_i > 4000 else 0,
+        'sa': sa.strip().lower() if sa else 'unknown',
+        'da': da.strip().lower() if da else 'unknown',
+    }
+
+
+def _parse_int(value, default=0):
+    value = str(value).strip()
+    if not value:
+        return default
+    try:
+        return int(value, 0)
+    except ValueError:
+        try:
+            return int(float(value))
+        except ValueError:
+            return default
+
+
+def _parse_float(value, default=0.0):
+    value = str(value).strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def _match_label_record(fname, label_records):

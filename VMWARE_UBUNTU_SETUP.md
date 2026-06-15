@@ -292,6 +292,14 @@ sa == device_mac 或 da == device_mac
 
 并输出目标设备在窗口内的上下行比例、帧长、IAT、RSSI、突发等 MAC 画像特征。
 
+该模式会优先使用普通用户权限运行：
+
+```text
+tshark -T fields
+```
+
+并在 tshark 阶段用目标 MAC 做过滤，因此通常比 PyShark 逐包读取更快。这里不使用 `sudo`，需要确保前面已经完成普通用户 `tshark/dumpcap` 权限配置。
+
 ### flow 模式仍可用
 
 flow 模式每条样本是一个单向 flow，适合调试和对比：
