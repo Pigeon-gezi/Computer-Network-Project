@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from sklearn.preprocessing import LabelEncoder
 
 from src.ml.dataset import Dataset
@@ -45,6 +45,8 @@ def main():
                         help='Random seed used by train_model.py')
     parser.add_argument('--positive-label', default='wireless_camera',
                         help='Positive label for binary AUC checks')
+    parser.add_argument('--group-col', default=None,
+                        help='Optional group column for grouped split audit')
     parser.add_argument('--top', type=int, default=20,
                         help='Number of strongest single-feature AUCs to print')
     args = parser.parse_args()
@@ -84,6 +86,10 @@ def main():
     _audit_random_split_overlap(
         df, args.label_col, args.test_size, args.random_state
     )
+    if args.group_col:
+        _audit_group_split_overlap(
+            df, args.label_col, args.group_col, args.test_size, args.random_state
+        )
     _audit_single_feature_auc(
         df, feature_names, args.label_col, args.positive_label, args.top
     )
@@ -132,6 +138,36 @@ def _audit_random_split_overlap(df, label_col, test_size, random_state):
         print(f"    {col:<12s}: {len(overlap)} values appear in both train and test")
         if overlap:
             print(f"        examples: {', '.join(overlap[:8])}")
+
+
+def _audit_group_split_overlap(df, label_col, group_col, test_size, random_state):
+    print(f"\n[*] Grouped split overlap by '{group_col}'")
+    if group_col not in df.columns:
+        print(f"    skipped: group column not found: {group_col}")
+        return
+
+    labels = LabelEncoder().fit_transform(df[label_col].values)
+    groups = df[group_col].astype(str).values
+    splitter = GroupShuffleSplit(
+        n_splits=1,
+        test_size=test_size,
+        random_state=random_state,
+    )
+    train_idx, test_idx = next(splitter.split(df, labels, groups))
+    train_df = df.iloc[train_idx]
+    test_df = df.iloc[test_idx]
+
+    train_groups = set(train_df[group_col].astype(str))
+    test_groups = set(test_df[group_col].astype(str))
+    overlap = sorted(train_groups & test_groups)
+    print(f"    Train rows: {len(train_df)}, Test rows: {len(test_df)}")
+    print(f"    Train groups: {len(train_groups)}, Test groups: {len(test_groups)}")
+    print(f"    {group_col:<12s}: {len(overlap)} values appear in both train and test")
+    if overlap:
+        print(f"        examples: {', '.join(overlap[:8])}")
+
+    print("    Test label counts:")
+    print(test_df[label_col].value_counts(dropna=False).to_string())
 
 
 def _audit_single_feature_auc(df, feature_names, label_col, positive_label, top):

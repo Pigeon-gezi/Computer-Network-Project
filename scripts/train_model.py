@@ -38,6 +38,9 @@ def main():
                         help='Random seed for train/test split')
     parser.add_argument('--cv', type=int, default=5,
                         help='Cross-validation folds')
+    parser.add_argument('--group-col', default=None,
+                        help='Optional group column for train/test split, '
+                             'e.g. source_file for device-window features')
     args = parser.parse_args()
 
     # Load data
@@ -53,12 +56,26 @@ def main():
     # Prepare dataset
     dataset = Dataset(df, label_col=args.label_col)
     X, y = dataset.prepare()
-    X_train, X_test, y_train, y_test = dataset.split(
-        test_size=args.test_size,
-        random_state=args.random_state,
-        stratify=(len(set(y)) > 1),
-        fit_scaler_on_train=True,
-    )
+    if args.group_col:
+        try:
+            split = dataset.split_by_group(
+                group_col=args.group_col,
+                test_size=args.test_size,
+                random_state=args.random_state,
+                fit_scaler_on_train=True,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+        X_train, X_test, y_train, y_test, train_idx, test_idx = split
+        _print_group_split_summary(df, args.group_col, train_idx, test_idx)
+    else:
+        X_train, X_test, y_train, y_test = dataset.split(
+            test_size=args.test_size,
+            random_state=args.random_state,
+            stratify=(len(set(y)) > 1),
+            fit_scaler_on_train=True,
+        )
 
     class_names = dataset.get_class_names()
     print(f"\nClasses: {class_names}")
@@ -74,6 +91,22 @@ def main():
     else:
         _train_multiclass_mode(X_train, y_train, X_test, y_test,
                                dataset, class_names, args)
+
+
+def _print_group_split_summary(df, group_col, train_idx, test_idx):
+    train_groups = sorted(df.iloc[train_idx][group_col].astype(str).unique())
+    test_groups = sorted(df.iloc[test_idx][group_col].astype(str).unique())
+    overlap = sorted(set(train_groups) & set(test_groups))
+
+    print(f"\nSplit mode: grouped by '{group_col}'")
+    print(f"Train groups: {len(train_groups)}, Test groups: {len(test_groups)}")
+    if overlap:
+        print(f"WARNING: group overlap detected: {overlap}")
+    else:
+        print("Group overlap: none")
+    print("Test groups:")
+    for group in test_groups:
+        print(f"    {group}")
 
 
 def _train_multiclass_mode(X_train, y_train, X_test, y_test,
