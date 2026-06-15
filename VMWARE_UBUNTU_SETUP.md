@@ -205,21 +205,139 @@ sudo python3 scripts/collect_training_data.py \
 pip3 install -r requirements.txt
 ```
 
-对抓到的 pcap 提取特征：
+### 特征级别选择
+
+当前特征提取支持两种级别：
+
+```text
+flow           默认模式；每条样本是一个 SA -> DA flow
+device-window  推荐正式实验使用；每条样本是目标 MAC 在一个时间窗口内的设备画像
+```
+
+课程任务强调“按 MAC 地址聚合统计，形成设备级流量画像”。因此正式训练和报告建议优先使用：
+
+```text
+--level device-window
+```
+
+flow 模式仍适合调试、对比和快速检查。
+
+### labels.csv 要求
+
+`device-window` 模式必须依赖真实设备 MAC。`data/labels.csv` 格式：
+
+```csv
+device_mac,device_type,session_id,notes,timestamp
+aa:bb:cc:dd:ee:ff,wireless_camera,wireless_camera_001,camera live view,2026-06-15T10:00:00
+11:22:33:44:55:66,tablet,tablet_001,tablet streaming,2026-06-15T10:10:00
+```
+
+`session_id` 仍支持前缀匹配，例如：
+
+```text
+tablet_ -> tablet_001.pcap, tablet_002.pcap, ...
+```
+
+但在 `device-window` 模式下，`device_mac` 不能是 `unknown`，否则脚本无法知道应该聚合哪个 MAC，会跳过对应 pcap。
+
+### 推荐数据目录
+
+建议把正式数据和临时数据分开：
+
+```text
+data/raw/train/        干净单目标训练 session
+data/raw/test/         独立 final test session
+data/raw/mixed_test/   混合设备演示场景
+data/raw/scratch/      临时抓包，不进训练
+```
+
+临时测试包、信道检查包、未确认标签的 pcap 不要放进 `train/`。
+
+### 推荐：MAC 窗口级特征
+
+训练集：
+
+```bash
+python3 scripts/extract_features.py \
+  -d data/raw/train \
+  -l data/labels.csv \
+  -o data/processed/train_device_window_features.csv \
+  --level device-window \
+  --window 30
+```
+
+测试集：
+
+```bash
+python3 scripts/extract_features.py \
+  -d data/raw/test \
+  -l data/labels.csv \
+  -o data/processed/test_device_window_features.csv \
+  --level device-window \
+  --window 30
+```
+
+窗口长度建议：
+
+```text
+--window 30  默认推荐；单条设备画像更稳定
+--window 15  样本更多，但每条画像更短、更噪
+```
+
+`device-window` 内部会按 `labels.csv` 中的 `device_mac` 聚合：
+
+```text
+sa == device_mac 或 da == device_mac
+```
+
+并输出目标设备在窗口内的上下行比例、帧长、IAT、RSSI、突发等 MAC 画像特征。
+
+### flow 模式仍可用
+
+flow 模式每条样本是一个单向 flow，适合调试和对比：
+
+```bash
+python3 scripts/extract_features.py \
+  -d data/raw/train \
+  -l data/labels.csv \
+  -o data/processed/train_flow_features.csv \
+  --level flow \
+  --mac-filter endpoint
+```
+
+flow 模式下 `--mac-filter` 可选：
+
+```text
+none         不过滤，旧行为
+source       只保留 sa == device_mac，适合可疑上传源分析
+destination  只保留 da == device_mac
+endpoint     保留 sa == device_mac 或 da == device_mac，适合设备相关 flow 对比
+```
+
+推荐：
+
+```text
+flow 训练对比：--mac-filter endpoint
+可疑上传源分析：--mac-filter source
+device-window 模式：不需要 --mac-filter
+```
+
+如果同时指定：
+
+```bash
+--level device-window --mac-filter endpoint
+```
+
+不会破坏结果，但 `--mac-filter` 不参与 `device-window` 逻辑，容易造成误解。`device-window` 总是按 `device_mac` 做设备级聚合。
+
+### 单文件调试
+
+对单个 pcap 做 flow 特征提取：
 
 ```bash
 python3 scripts/extract_features.py \
   -i data/raw/test_capture.pcap \
   -o data/processed/test_features.csv
-```
-
-如果已经有多个带标签 pcap，可以批量提取：
-
-```bash
-python3 scripts/extract_features.py \
-  -d data/raw \
-  -l data/labels.csv \
-  -o data/processed/features.csv
 ```
 
 ## 9. 标注采集样本
@@ -274,22 +392,30 @@ data/raw/wireless_camera_001.pcap -> session_id = wireless_camera_001
 
 ## 10. 训练和检测
 
-训练多分类模型：
+推荐训练二分类摄像头检测模型：
 
 ```bash
 python3 scripts/train_model.py \
-  -f data/processed/features.csv \
-  -o data/models
-```
-
-训练摄像头二分类模型：
-
-```bash
-python3 scripts/train_model.py \
-  -f data/processed/features.csv \
+  -f data/processed/train_device_window_features.csv \
   -o data/models \
-  --binary-camera
+  --binary-camera \
+  --cv 2
 ```
+
+此时 `train_model.py` 内部会从训练集里再切出一部分作为 validation / internal test。
+
+使用独立测试集做最终评估：
+
+```bash
+python3 scripts/evaluate_model.py \
+  -f data/processed/test_device_window_features.csv \
+  -m data/models \
+  --binary \
+  --external-test \
+  -o report/final_device_window_test
+```
+
+`--external-test` 表示整份输入 CSV 都是 final held-out test，不再随机切分。
 
 运行检测：
 
@@ -343,3 +469,60 @@ tshark -r data/raw/test_capture.pcap -c 5
 4. 是否使用了 sudo
 5. VMware USB Controller 是否启用 USB 3.0 / 3.1
 ```
+
+### device-window 输出为空
+
+常见原因：
+
+```text
+1. labels.csv 中 device_mac 是 unknown
+2. 设备启用了随机 MAC，labels.csv 记录的 MAC 和 pcap 中实际 MAC 不一致
+3. pcap 没抓到目标热点信道
+4. session_id 前缀没有匹配到 pcap 文件名
+```
+
+可以用下面命令检查 pcap 中的源 MAC：
+
+```bash
+tshark -r data/raw/train/tablet_001.pcap \
+  -Y "wlan.fc.type == 2" \
+  -T fields -e wlan.sa | sort | uniq -c | sort -nr | head
+```
+
+### device-window 样本数变少
+
+这是正常现象。`device-window` 是按时间窗口聚合：
+
+```text
+一个 pcap 的一个目标 MAC 每 30 秒 -> 一条样本
+```
+
+如果样本太少，可以调小窗口：
+
+```bash
+--window 15
+```
+
+但窗口越短，单条设备画像越不稳定。
+
+### 混合数据怎么用
+
+混合 pcap 不建议直接放进 `train/`。推荐用途：
+
+```text
+mixed_test/ 中用于演示和最终鲁棒性测试
+```
+
+如果要把混合 pcap 用于训练，必须依赖 MAC 级标签和 device-window 聚合，不能把整份 pcap 简单标成一个类别。
+
+### 类别名称显示
+
+训练和评估会保存并使用类别名，例如：
+
+```text
+non_wireless_camera
+wireless_camera
+tablet
+```
+
+不会只显示数字编码。
