@@ -12,6 +12,5 @@ data/models/*
 *.pcap
 *.pcapng
 *.joblib
-report/
 
 .vscode/
