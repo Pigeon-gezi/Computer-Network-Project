@@ -8,6 +8,7 @@ from tqdm import tqdm
 from .per_frame_features import extract_per_frame_features
 from .per_flow_features import group_frames_into_flows, extract_flow_features
 from .burst_detector import detect_bursts, compute_burst_statistics
+from .per_device_features import extract_device_window_features
 from ..parser.pcap_reader import PcapReader
 
 
@@ -36,23 +37,13 @@ class FeatureExtractor:
         progress = self.show_progress if show_progress is None else show_progress
         pcap_name = os.path.basename(pcap_path)
 
-        # Step 1: Parse pcap -> per-frame features
-        all_frames = self._read_frames(pcap_path, max_frames=max_frames,
-                                       show_progress=progress,
-                                       desc=f"Reading {pcap_name}")
+        # Step 1-2: Parse pcap -> per-frame features
+        frame_features = self._extract_frame_features_from_pcap(
+            pcap_path, max_frames=max_frames, show_progress=progress,
+            desc_name=pcap_name)
 
-        if not all_frames:
+        if not frame_features:
             return pd.DataFrame()
-
-        # Step 2: Extract per-frame features
-        frame_features = []
-        frame_iter = tqdm(all_frames, desc=f"Frame features {pcap_name}",
-                          unit='frame', disable=not progress)
-        for fi in frame_iter:
-            feats = extract_per_frame_features(fi)
-            feats['sa'] = fi.sa or 'unknown'
-            feats['da'] = fi.da or 'unknown'
-            frame_features.append(feats)
 
         # Step 3: Group into flows
         flows = group_frames_into_flows(frame_features, self.flow_timeout)
@@ -84,7 +75,7 @@ class FeatureExtractor:
         return df
 
     def extract_from_pcap_batch(self, pcap_dir, label_map=None, max_frames=None,
-                                show_progress=None):
+                                show_progress=None, mac_filter='none'):
         """Extract features from all pcap files in a directory.
 
         Args:
@@ -110,13 +101,15 @@ class FeatureExtractor:
                 continue
 
             # Try to match label
-            if label_map:
-                for prefix, label in label_map.items():
-                    if fname.startswith(prefix):
-                        df['device_type'] = label
-                        break
-                else:
-                    df['device_type'] = 'unknown'
+            label_record = _match_label_record(fname, label_map)
+            if label_record:
+                device_type = label_record['device_type']
+                df['device_type'] = device_type
+                df = _filter_by_labeled_mac(df, label_record, mac_filter)
+                if df.empty:
+                    continue
+            elif label_map:
+                df['device_type'] = 'unknown'
             df['source_file'] = fname
             all_dfs.append(df)
 
@@ -125,6 +118,69 @@ class FeatureExtractor:
 
         result = pd.concat(all_dfs, ignore_index=True)
         return result
+
+    def extract_device_windows_from_pcap(self, pcap_path, target_mac,
+                                         window_sec=None, max_frames=None,
+                                         show_progress=None):
+        """Extract MAC-level device profiles per time window from one pcap."""
+        progress = self.show_progress if show_progress is None else show_progress
+        pcap_name = os.path.basename(pcap_path)
+        if window_sec is None:
+            window_sec = self.window_duration
+
+        frame_features = self._extract_frame_features_from_pcap(
+            pcap_path, max_frames=max_frames, show_progress=progress,
+            desc_name=pcap_name)
+        if not frame_features:
+            return pd.DataFrame()
+
+        rows = extract_device_window_features(
+            frame_features,
+            target_mac=target_mac,
+            window_sec=window_sec,
+            burst_iat_threshold_ms=self.burst_iat_threshold,
+            min_burst_packets=self.min_burst_packets,
+        )
+        return pd.DataFrame(rows)
+
+    def extract_device_windows_batch(self, pcap_dir, label_map, max_frames=None,
+                                     show_progress=None, window_sec=None):
+        """Extract labeled MAC-level window features for all pcaps in a directory."""
+        progress = self.show_progress if show_progress is None else show_progress
+        all_dfs = []
+        pcap_files = [
+            fname for fname in sorted(os.listdir(pcap_dir))
+            if fname.endswith(('.pcap', '.pcapng'))
+        ]
+        file_iter = tqdm(pcap_files, desc="PCAP files", unit='file',
+                         disable=not progress)
+        for fname in file_iter:
+            label_record = _match_label_record(fname, label_map)
+            if not label_record:
+                print(f"WARNING: skip {fname}: no matching label")
+                continue
+
+            target_mac = str(label_record.get('device_mac', '')).strip().lower()
+            if not target_mac or target_mac in ('unknown', 'nan'):
+                print(f"WARNING: skip {fname}: device-window level requires "
+                      f"a concrete device_mac")
+                continue
+
+            path = os.path.join(pcap_dir, fname)
+            df = self.extract_device_windows_from_pcap(
+                path, target_mac=target_mac, window_sec=window_sec,
+                max_frames=max_frames, show_progress=progress)
+            if df.empty:
+                print(f"WARNING: skip {fname}: no frames for {target_mac}")
+                continue
+
+            df['device_type'] = label_record['device_type']
+            df['source_file'] = fname
+            all_dfs.append(df)
+
+        if not all_dfs:
+            return pd.DataFrame()
+        return pd.concat(all_dfs, ignore_index=True)
 
     def get_feature_matrix(self, flow_df):
         """Extract numeric feature matrix X from flow DataFrame.
@@ -198,6 +254,22 @@ class FeatureExtractor:
             frames.append(frame)
         return frames
 
+    def _extract_frame_features_from_pcap(self, pcap_path, max_frames=None,
+                                          show_progress=False, desc_name=None):
+        pcap_name = desc_name or os.path.basename(pcap_path)
+        all_frames = self._read_frames(
+            pcap_path, max_frames=max_frames, show_progress=show_progress,
+            desc=f"Reading {pcap_name}")
+        frame_features = []
+        frame_iter = tqdm(all_frames, desc=f"Frame features {pcap_name}",
+                          unit='frame', disable=not show_progress)
+        for fi in frame_iter:
+            feats = extract_per_frame_features(fi)
+            feats['sa'] = fi.sa or 'unknown'
+            feats['da'] = fi.da or 'unknown'
+            frame_features.append(feats)
+        return frame_features
+
 
 def _extract_window_features(window_frames, win_idx, t0, window_sec):
     """Extract aggregate features for a single time window."""
@@ -259,3 +331,47 @@ def _extract_window_features(window_frames, win_idx, t0, window_sec):
                             if f.get('is_qos_data', 0) == 1) / n
 
     return row
+
+
+def _match_label_record(fname, label_records):
+    if not label_records:
+        return None
+
+    if isinstance(label_records, dict):
+        items = [
+            {'session_id': prefix, 'device_type': device, 'device_mac': 'unknown'}
+            for prefix, device in label_records.items()
+        ]
+    else:
+        items = label_records
+
+    for record in items:
+        prefix = str(record.get('session_id', ''))
+        if prefix and fname.startswith(prefix):
+            return record
+    return None
+
+
+def _filter_by_labeled_mac(df, label_record, mac_filter):
+    if mac_filter == 'none':
+        return df
+
+    target_mac = str(label_record.get('device_mac', '')).strip().lower()
+    if not target_mac or target_mac == 'unknown' or target_mac == 'nan':
+        print(f"WARNING: skip {label_record.get('session_id', '')}: "
+              f"MAC filter '{mac_filter}' requires a concrete device_mac")
+        return df.iloc[0:0]
+
+    sa = df['sa'].astype(str).str.lower() if 'sa' in df.columns else ''
+    da = df['da'].astype(str).str.lower() if 'da' in df.columns else ''
+
+    if mac_filter == 'source':
+        mask = sa == target_mac
+    elif mac_filter == 'destination':
+        mask = da == target_mac
+    elif mac_filter == 'endpoint':
+        mask = (sa == target_mac) | (da == target_mac)
+    else:
+        raise ValueError(f"Unsupported mac_filter: {mac_filter}")
+
+    return df[mask].copy()

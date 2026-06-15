@@ -24,15 +24,22 @@ def main():
     parser.add_argument('--output', '-o', required=True,
                         help='Output CSV path (or directory for batch)')
     parser.add_argument('--labels', '-l', help='labels.csv file for supervised data')
+    parser.add_argument('--level', choices=['flow', 'device-window'],
+                        default='flow',
+                        help='Feature level to extract')
     parser.add_argument('--max-frames', type=int, help='Max frames per file')
     parser.add_argument('--window', type=float, default=10.0,
-                        help='Window duration for window features (seconds)')
+                        help='Window duration for window/device-window features')
     parser.add_argument('--flow-timeout', type=float, default=5.0,
                         help='Flow timeout (seconds)')
     parser.add_argument('--burst-threshold', type=float, default=1.0,
                         help='Burst IAT threshold (ms)')
     parser.add_argument('--extract-windows', action='store_true',
                         help='Also extract window-level features')
+    parser.add_argument('--mac-filter',
+                        choices=['none', 'source', 'destination', 'endpoint'],
+                        default='none',
+                        help='Filter flows by labeled device MAC in batch mode')
     parser.add_argument('--no-progress', action='store_true',
                         help='Disable progress bars')
     args = parser.parse_args()
@@ -47,8 +54,17 @@ def main():
     if args.input_dir:
         # Batch mode
         label_map = _load_labels(args.labels) if args.labels else None
-        df = extractor.extract_from_pcap_batch(
-            args.input_dir, label_map, max_frames=args.max_frames)
+        if args.level == 'device-window':
+            if not label_map:
+                print("ERROR: --level device-window requires --labels.")
+                sys.exit(1)
+            df = extractor.extract_device_windows_batch(
+                args.input_dir, label_map, max_frames=args.max_frames,
+                window_sec=args.window)
+        else:
+            df = extractor.extract_from_pcap_batch(
+                args.input_dir, label_map, max_frames=args.max_frames,
+                mac_filter=args.mac_filter)
         if df.empty:
             print("No features extracted. Check pcap files and monitor mode.")
             sys.exit(1)
@@ -57,6 +73,10 @@ def main():
         print(f"    Columns: {list(df.columns)}")
 
     elif args.input:
+        if args.level != 'flow':
+            print("ERROR: single-file device-window extraction requires batch mode "
+                  "with --input-dir and --labels.")
+            sys.exit(1)
         # Single file
         df = extractor.extract_from_pcap(args.input, max_frames=args.max_frames)
         if df.empty:
@@ -79,20 +99,25 @@ def main():
 
 
 def _load_labels(labels_path):
-    """Parse labels.csv into {session_prefix: device_type} mapping."""
+    """Parse labels.csv into label records sorted by longest prefix first."""
     if not os.path.exists(labels_path):
         print(f"WARNING: labels file not found: {labels_path}")
         return None
 
     labels_df = pd.read_csv(labels_path)
-    label_items = []
+    label_records = []
     for _, row in labels_df.iterrows():
-        session = row.get('session_id', '')
-        device = row.get('device_type', 'unknown')
+        session = str(row.get('session_id', '')).strip()
+        device = str(row.get('device_type', 'unknown')).strip()
+        mac = str(row.get('device_mac', 'unknown')).strip().lower()
         if session:
-            label_items.append((session, device))
-    label_items.sort(key=lambda item: len(item[0]), reverse=True)
-    return dict(label_items)
+            label_records.append({
+                'session_id': session,
+                'device_type': device,
+                'device_mac': mac,
+            })
+    label_records.sort(key=lambda item: len(item['session_id']), reverse=True)
+    return label_records
 
 
 if __name__ == '__main__':
