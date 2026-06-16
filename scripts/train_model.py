@@ -41,6 +41,9 @@ def main():
     parser.add_argument('--group-col', default=None,
                         help='Optional group column for train/test split, '
                              'e.g. source_file for device-window features')
+    parser.add_argument('--no-stratified-group', action='store_true',
+                        help='Use plain grouped split instead of stratified '
+                             'grouped split')
     args = parser.parse_args()
 
     # Load data
@@ -63,12 +66,14 @@ def main():
                 test_size=args.test_size,
                 random_state=args.random_state,
                 fit_scaler_on_train=True,
+                stratify=not args.no_stratified_group,
             )
         except ValueError as exc:
             print(f"ERROR: {exc}")
             sys.exit(1)
         X_train, X_test, y_train, y_test, train_idx, test_idx = split
-        _print_group_split_summary(df, args.group_col, train_idx, test_idx)
+        _print_group_split_summary(
+            df, args.group_col, args.label_col, train_idx, test_idx)
     else:
         X_train, X_test, y_train, y_test = dataset.split(
             test_size=args.test_size,
@@ -93,7 +98,7 @@ def main():
                                dataset, class_names, args)
 
 
-def _print_group_split_summary(df, group_col, train_idx, test_idx):
+def _print_group_split_summary(df, group_col, label_col, train_idx, test_idx):
     train_groups = sorted(df.iloc[train_idx][group_col].astype(str).unique())
     test_groups = sorted(df.iloc[test_idx][group_col].astype(str).unique())
     overlap = sorted(set(train_groups) & set(test_groups))
@@ -104,6 +109,10 @@ def _print_group_split_summary(df, group_col, train_idx, test_idx):
         print(f"WARNING: group overlap detected: {overlap}")
     else:
         print("Group overlap: none")
+    print("\nTrain label counts:")
+    print(df.iloc[train_idx][label_col].value_counts().to_string())
+    print("\nTest label counts:")
+    print(df.iloc[test_idx][label_col].value_counts().to_string())
     print("Test groups:")
     for group in test_groups:
         print(f"    {group}")

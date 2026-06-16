@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 from src.ml.dataset import Dataset
@@ -146,14 +146,15 @@ def _audit_group_split_overlap(df, label_col, group_col, test_size, random_state
         print(f"    skipped: group column not found: {group_col}")
         return
 
-    labels = LabelEncoder().fit_transform(df[label_col].values)
-    groups = df[group_col].astype(str).values
-    splitter = GroupShuffleSplit(
-        n_splits=1,
+    dataset = Dataset(df, label_col=label_col)
+    dataset.prepare()
+    _, _, _, _, train_idx, test_idx = dataset.split_by_group(
+        group_col=group_col,
         test_size=test_size,
         random_state=random_state,
+        fit_scaler_on_train=False,
+        stratify=True,
     )
-    train_idx, test_idx = next(splitter.split(df, labels, groups))
     train_df = df.iloc[train_idx]
     test_df = df.iloc[test_idx]
 
