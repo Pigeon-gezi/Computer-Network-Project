@@ -1,0 +1,8 @@
+name,feature,op,threshold,weight,description,requires_positive
+tx_packet_ratio_high,tx_packet_ratio,>=,0.6,2,device appears as transmitter in most frames,
+uplink_packet_ratio_high,uplink_packet_ratio,>=,0.5,2,traffic is dominated by STA-to-AP uplink frames,
+large_frame_ratio_high,large_frame_ratio,>=,0.4,2,many frames are large video-like data frames,
+qos_data_ratio_high,qos_data_ratio,>=,0.4,1,many data frames use QoS,
+iat_stable,cv_iat,<=,0.8,1,inter-arrival times are relatively stable,mean_iat
+bursty_upload,burst_count,>=,3.0,1,window contains repeated frame bursts,
+throughput_high,throughput_bps,>=,1000000.0,1,aggregate throughput exceeds 1 Mbps,
