@@ -1,3 +1,6 @@
 device_mac,device_type,session_id,notes,timestamp
 94:ff:7d:95:7f:d5,wireless_camera,wireless_camera_,phone hotspot camera video,2026-06-10T00:06:00
 5a:b0:67:24:26:e1,tablet,tablet_,known camera mac,2026-06-10T01:13:26
+78:be:81:ac:9a:73,wireless_camera,wireless_camera_2_,phone hotspot camera live view,2026-06-15T18:48:24
+e2:38:00:26:4a:f8,smartphone,phone_1_,phone from jyx,2026-06-15T18:54:39
+a8:37:59:41:57:48,tablet,tablet_2_,tablet 2,2026-06-15T23:18:42
