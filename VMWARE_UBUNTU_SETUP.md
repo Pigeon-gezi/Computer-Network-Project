@@ -454,6 +454,54 @@ python3 scripts/evaluate_model.py \
 
 `--external-test` 表示整份输入 CSV 都是 final held-out test，不再随机切分。
 
+### 规则判定 baseline
+
+课程基础要求需要基于统计特征构建规则化判决逻辑。机器学习模型训练时不使用 `camera_heuristic_score`，但可以单独评估规则法作为 baseline，并与 SVM/RandomForest 结果对比。
+
+在独立测试集上评估规则法：
+
+```bash
+python3 scripts/evaluate_rules.py \
+  -f data/processed/test_device_window_features.csv \
+  -o report/rule_baseline_test \
+  --positive-label wireless_camera \
+  --threshold 5
+```
+
+规则法会根据 MAC 窗口画像打分，例如：
+
+```text
+发送包占比高
+上行包占比高
+长帧比例高
+QoS 数据帧比例高
+包间隔较稳定
+burst 数量较多
+吞吐率较高
+```
+
+输出包括：
+
+```text
+rule_predictions.csv              每个 window 的规则分数、触发规则和预测结果
+rules.csv                         当前规则表
+rule_metrics.json                 accuracy、precision、recall、F1、误报率、漏报率
+rule_confusion_matrix.png          混淆矩阵
+rule_confusion_matrix_norm.png     归一化混淆矩阵
+```
+
+如果规则法误报较多，可以提高阈值，例如：
+
+```bash
+--threshold 6
+```
+
+如果规则法漏报较多，可以降低阈值，例如：
+
+```bash
+--threshold 4
+```
+
 ### 未知 pcap 检测模式
 
 正式演示时更常见的输入是一份未标注的现场 pcap。此时不应该依赖 `labels.csv`，而是让程序枚举 pcap 中出现的 MAC，逐个建立 device-window 画像，再用训练好的 `camera_detector` 判断哪些 MAC 疑似摄像头。
