@@ -18,6 +18,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix
 
 from src.ml.model_persistence import load_model, save_results
 from src.ml.model_evaluator import (
@@ -110,17 +111,19 @@ def main():
         print(f"    Evaluation mode: split test_size={args.test_size}, "
               f"random_state={args.random_state}")
 
-    # Evaluate
-    y_for_report = y_test
-    report_class_names = class_names
     if args.binary:
         camera_idx = _find_camera_class_index(class_names)
         y_for_report = (y_test == camera_idx).astype(int)
         report_class_names = model_label_names
-
-    results = evaluate_model(model, X_test_scaled, y_for_report,
-                             report_class_names)
-    print_evaluation(results, report_class_names)
+        results = _evaluate_binary_model(
+            model, X_test_scaled, y_for_report, report_class_names)
+        _print_binary_evaluation(results, report_class_names)
+    else:
+        y_for_report = y_test
+        report_class_names = class_names
+        results = evaluate_model(model, X_test_scaled, y_for_report,
+                                 report_class_names)
+        print_evaluation(results, report_class_names)
 
     # Cross-validation
     cv_y = y
@@ -156,7 +159,13 @@ def main():
     print("    confusion_matrix_norm.png")
 
     # ROC curves
-    if results.get('roc_auc'):
+    if args.binary and results.get('roc_auc'):
+        fig = plot_roc_curves(
+            {report_class_names[1]: results['roc_auc']},
+            save_path=os.path.join(args.output, 'roc_curves.png'))
+        plt.close(fig)
+        print("    roc_curves.png")
+    elif results.get('roc_auc'):
         fig = plot_roc_curves(
             results['roc_auc'],
             save_path=os.path.join(args.output, 'roc_curves.png'))
@@ -190,14 +199,24 @@ def main():
     print(f"    pca_scatter.png (explained variance: {evr[0]:.2%}, {evr[1]:.2%})")
 
     # Binary detection
-    if args.binary or len(class_names) == 2:
+    if args.binary:
+        det_results = results
+        fig = plot_camera_detection_summary(
+            det_results,
+            save_path=os.path.join(args.output, 'camera_detection.png'))
+        plt.close(fig)
+        print("    camera_detection.png")
+
+        if 'pr_curve' in det_results:
+            fig = plot_pr_curve(
+                det_results['pr_curve'],
+                save_path=os.path.join(args.output, 'pr_curve.png'))
+            plt.close(fig)
+            print("    pr_curve.png")
+    elif len(class_names) == 2:
         camera_idx = _find_camera_class_index(class_names)
-        if args.binary:
-            y_det = (y_test == camera_idx).astype(int)
-            positive_label = 1
-        else:
-            y_det = y_test
-            positive_label = camera_idx
+        y_det = y_test
+        positive_label = camera_idx
         det_results = evaluate_binary_detection(
             model, X_test_scaled, y_det, positive_label=positive_label)
         fig = plot_camera_detection_summary(
@@ -217,15 +236,60 @@ def main():
     save_results(results)
 
     print(f"\n[*] Report generated in {args.output}")
-    print(f"[*] Top 5 features for camera detection:")
-    camera_features = ['large_frame_ratio', 'mean_frame_size', 'uplink_ratio',
-                       'qos_data_ratio', 'burst_density', 'cv_iat',
-                       'burst_regularity', 'mean_data_rate', 'protected_ratio']
+    print("\n[*] Top 10 features by RandomForest importance on this dataset:")
+    for _, row in imp_df.head(10).iterrows():
+        print(f"    {row['feature']:<30s} rank={int(row['rank']):3d}  "
+              f"importance={row['importance']:.4f}")
+
+    print("\n[*] Domain camera feature ranks:")
+    camera_features = [
+        'large_frame_ratio', 'mean_frame_size', 'uplink_packet_ratio',
+        'uplink_bytes_ratio', 'tx_packet_ratio', 'qos_data_ratio',
+        'burst_density', 'cv_iat', 'burst_regularity', 'mean_data_rate',
+        'protected_ratio',
+    ]
     for feat in camera_features:
         if feat in imp_df['feature'].values:
             rank = imp_df[imp_df['feature'] == feat]['rank'].values[0]
             imp = imp_df[imp_df['feature'] == feat]['importance'].values[0]
             print(f"    {feat:<30s} rank={rank:3d}  importance={imp:.4f}")
+
+
+def _evaluate_binary_model(model, X_test_scaled, y_true_bin, class_names):
+    results = evaluate_binary_detection(
+        model, X_test_scaled, y_true_bin, positive_label=1)
+    y_pred = model.predict(X_test_scaled)
+    y_pred_bin = (y_pred == 1).astype(int)
+    results['accuracy'] = (y_pred_bin == y_true_bin).mean()
+    results['confusion_matrix'] = confusion_matrix(
+        y_true_bin, y_pred_bin, labels=[0, 1])
+    results['classification_report'] = classification_report(
+        y_true_bin,
+        y_pred_bin,
+        target_names=class_names,
+        zero_division=0,
+    )
+    return results
+
+
+def _print_binary_evaluation(results, class_names):
+    print("=" * 60)
+    print("Binary Camera Detection Results")
+    print("=" * 60)
+    print(f"Accuracy:            {results['accuracy']:.4f}")
+    print(f"F1:                  {results['f1']:.4f}")
+    print(f"Precision:           {results['precision']:.4f}")
+    print(f"Recall:              {results['detection_rate']:.4f}")
+    print(f"False Alarm Rate:    {results['false_alarm_rate']:.4f}")
+    if results.get('roc_auc'):
+        print(f"ROC AUC:             {results['roc_auc']['auc']:.4f}")
+    print("\n" + results['classification_report'])
+    print("Confusion Matrix:")
+    cm = results['confusion_matrix']
+    header = " " * 20 + "".join(f"{n:>22s}" for n in class_names)
+    print(header)
+    for i, row in enumerate(cm):
+        print(f"{class_names[i]:>20s}  " + "".join(f"{v:22d}" for v in row))
 
 
 if __name__ == '__main__':

@@ -5,7 +5,7 @@ import pandas as pd
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     classification_report, confusion_matrix, roc_curve, auc,
-    precision_recall_curve
+    precision_recall_curve, roc_auc_score
 )
 from sklearn.model_selection import cross_val_score, cross_validate
 
@@ -119,22 +119,36 @@ def evaluate_binary_detection(model, X_test, y_test, positive_label=1):
 
     # PR curve
     try:
-        classes = getattr(model, 'classes_', None)
-        if classes is not None:
-            prob_idx = list(classes).index(positive_label)
-        else:
-            prob_idx = positive_label
-        y_prob = model.predict_proba(X_test)[:, prob_idx]
+        y_prob = _positive_class_probability(model, X_test, positive_label)
         precision_curve, recall_curve, _ = precision_recall_curve(
             y_true_bin, y_prob)
+        fpr, tpr, _ = roc_curve(y_true_bin, y_prob)
         results['pr_curve'] = {
             'precision': precision_curve.tolist(),
             'recall': recall_curve.tolist(),
+        }
+        results['roc_auc'] = {
+            'auc': roc_auc_score(y_true_bin, y_prob),
+            'fpr': fpr.tolist(),
+            'tpr': tpr.tolist(),
         }
     except (AttributeError, Exception):
         pass
 
     return results
+
+
+def _positive_class_probability(model, X_test, positive_label=1):
+    classes = getattr(model, 'classes_', None)
+    if classes is None and hasattr(model, 'named_steps'):
+        final_step = list(model.named_steps.values())[-1]
+        classes = getattr(final_step, 'classes_', None)
+
+    if classes is not None:
+        prob_idx = list(classes).index(positive_label)
+    else:
+        prob_idx = positive_label
+    return model.predict_proba(X_test)[:, prob_idx]
 
 
 def print_evaluation(results, class_names=None):
