@@ -1,0 +1,23 @@
+{
+  "accuracy": 0.9987577639751553,
+  "precision": 0.997229916897507,
+  "recall": 1.0,
+  "f1": 0.9986130374479889,
+  "true_positive": 360,
+  "false_positive": 1,
+  "true_negative": 444,
+  "false_negative": 0,
+  "detection_rate": 1.0,
+  "false_alarm_rate": 0.0022471910112359553,
+  "miss_rate": 0.0,
+  "confusion_matrix": [
+    [
+      444,
+      1
+    ],
+    [
+      0,
+      360
+    ]
+  ]
+}
