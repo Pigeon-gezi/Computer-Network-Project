@@ -378,7 +378,3 @@ __pycache__/
 | 指标评估 | `scripts/evaluate_model.py`、`scripts/evaluate_rules.py` 输出混淆矩阵、F1、误报率、漏报率 |
 | AI 扩展 | SVM、RandomForest、Ensemble 摄像头检测 |
 | 现场演示 | `scripts/detect_unknown_pcap.py` 对未知 pcap 输出候选摄像头 MAC |
-
-## 许可证
-
-本项目为课程作业，仅供学习与实验展示使用。
