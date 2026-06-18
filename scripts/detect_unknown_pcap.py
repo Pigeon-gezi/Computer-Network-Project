@@ -3,7 +3,8 @@
 
 This is an inference/demo entry point. It does not require labels.csv.
 It ranks MAC addresses observed in one pcap, extracts MAC-level window
-features for each candidate, and aggregates model predictions per MAC.
+features for each candidate, and aggregates rule and/or model predictions
+per MAC.
 """
 
 import argparse
@@ -20,6 +21,7 @@ import pandas as pd
 
 from src.features.feature_extractor import FeatureExtractor
 from src.ml.model_persistence import load_model, export_predictions_csv
+from src.ml.rule_baseline import DEFAULT_RULE_THRESHOLD, predict_dataframe
 
 MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 HIGH_RISK_MODEL_FEATURES = {
@@ -40,6 +42,12 @@ def main():
         description="Detect suspicious camera MACs from an unlabeled pcap"
     )
     parser.add_argument("--pcap", "-p", required=True, help="Input pcap file")
+    parser.add_argument(
+        "--method",
+        choices=["ml", "rule", "both"],
+        default="ml",
+        help="Detection method: trained ML model, rule baseline, or both",
+    )
     parser.add_argument("--model", "-m", default="data/models/", help="Model directory")
     parser.add_argument(
         "--model-name",
@@ -77,13 +85,25 @@ def main():
         "--camera-threshold",
         type=float,
         default=0.6,
-        help="Mean camera probability threshold",
+        help="ML mode: mean camera probability threshold",
     )
     parser.add_argument(
         "--window-ratio-threshold",
         type=float,
         default=0.5,
-        help="Camera-window ratio threshold",
+        help="ML mode: camera-window ratio threshold",
+    )
+    parser.add_argument(
+        "--rule-threshold",
+        type=float,
+        default=DEFAULT_RULE_THRESHOLD,
+        help="Rule mode: minimum rule score for camera prediction",
+    )
+    parser.add_argument(
+        "--rule-window-ratio-threshold",
+        type=float,
+        default=0.5,
+        help="Rule mode: suspicious if this fraction of windows pass rules",
     )
     parser.add_argument(
         "--max-frames", type=int, help="Max frames per MAC during feature extraction"
@@ -97,15 +117,28 @@ def main():
         print(f"ERROR: pcap not found: {args.pcap}")
         sys.exit(1)
 
-    model, scaler, metadata = load_model(args.model, args.model_name)
-    feature_names = metadata["feature_names"]
-    label_names = metadata["label_names"]
+    use_ml = args.method in ("ml", "both")
+    use_rule = args.method in ("rule", "both")
+    model = scaler = metadata = None
+    feature_names = label_names = None
+    camera_label_idx = camera_prob_col = None
 
-    print(f"[*] Loaded model: {metadata.get('model_type', 'unknown')}")
-    print(f"    Model name: {args.model_name}")
-    print(f"    Classes: {label_names}")
-    print(f"    Features: {len(feature_names)}")
-    _warn_if_risky_features(feature_names)
+    print(f"[*] Detection method: {args.method}")
+    if use_ml:
+        model, scaler, metadata = load_model(args.model, args.model_name)
+        feature_names = metadata["feature_names"]
+        label_names = metadata["label_names"]
+
+        print(f"[*] Loaded model: {metadata.get('model_type', 'unknown')}")
+        print(f"    Model name: {args.model_name}")
+        print(f"    Classes: {label_names}")
+        print(f"    Features: {len(feature_names)}")
+        _warn_if_risky_features(feature_names)
+
+        camera_label_idx = find_camera_label_index(label_names)
+        camera_prob_col = find_probability_column(model, camera_label_idx)
+    else:
+        print("[*] Rule-only mode: model loading skipped")
 
     print(f"\n[*] Enumerating MACs in {args.pcap}")
     candidates = enumerate_macs(args.pcap)
@@ -139,9 +172,6 @@ def main():
         show_progress=not args.no_progress,
     )
 
-    camera_label_idx = find_camera_label_index(label_names)
-    camera_prob_col = find_probability_column(model, camera_label_idx)
-
     results = []
     for i, candidate in enumerate(candidates, start=1):
         mac = candidate["mac"]
@@ -159,10 +189,16 @@ def main():
                 {
                     "status": "no_features",
                     "window_count": 0,
-                    "predicted_type": "unknown",
-                    "camera_prob_mean": 0.0,
-                    "camera_prob_max": 0.0,
-                    "camera_window_ratio": 0.0,
+                    "ml_predicted_type": "unknown",
+                    "ml_camera_prob_mean": 0.0,
+                    "ml_camera_prob_max": 0.0,
+                    "ml_camera_window_ratio": 0.0,
+                    "ml_suspicious_camera": False,
+                    "rule_score_mean": 0.0,
+                    "rule_score_max": 0.0,
+                    "rule_camera_window_ratio": 0.0,
+                    "rule_camera_pred_windows": 0,
+                    "rule_suspicious_camera": False,
                     "suspicious_camera": False,
                 }
             )
@@ -170,41 +206,43 @@ def main():
             print("    no device-window features")
             continue
 
-        mac_summary = predict_and_aggregate(
-            df=df,
-            model=model,
-            scaler=scaler,
-            feature_names=feature_names,
-            label_names=label_names,
-            camera_label_idx=camera_label_idx,
-            camera_prob_col=camera_prob_col,
-            camera_threshold=args.camera_threshold,
-            window_ratio_threshold=args.window_ratio_threshold,
+        mac_summary = {"status": "ok", "window_count": len(df)}
+        if use_ml:
+            mac_summary.update(
+                predict_ml_and_aggregate(
+                    df=df,
+                    model=model,
+                    scaler=scaler,
+                    feature_names=feature_names,
+                    label_names=label_names,
+                    camera_label_idx=camera_label_idx,
+                    camera_prob_col=camera_prob_col,
+                    camera_threshold=args.camera_threshold,
+                    window_ratio_threshold=args.window_ratio_threshold,
+                )
+            )
+        if use_rule:
+            mac_summary.update(
+                predict_rule_and_aggregate(
+                    df=df,
+                    rule_threshold=args.rule_threshold,
+                    rule_window_ratio_threshold=args.rule_window_ratio_threshold,
+                )
+            )
+        mac_summary["suspicious_camera"] = _combined_suspicious(
+            mac_summary, use_ml=use_ml, use_rule=use_rule
         )
+        mac_summary.update(key_feature_means(df))
         summary.update(mac_summary)
         results.append(summary)
 
         flag = "YES" if summary["suspicious_camera"] else "no"
-        print(
-            f"    windows={summary['window_count']}  "
-            f"camera_prob_mean={summary['camera_prob_mean']:.3f}  "
-            f"camera_window_ratio={summary['camera_window_ratio']:.3f}  "
-            f"suspicious={flag}"
-        )
+        print_candidate_result(summary, use_ml=use_ml, use_rule=use_rule, flag=flag)
 
     result_df = pd.DataFrame(results)
-    result_df = result_df.sort_values(
-        [
-            "suspicious_camera",
-            "camera_prob_mean",
-            "camera_window_ratio",
-            "data_source_frames",
-            "total_frames",
-        ],
-        ascending=[False, False, False, False, False],
-    )
+    result_df = sort_results(result_df, method=args.method)
 
-    print_summary(result_df)
+    print_summary(result_df, method=args.method)
     export_predictions_csv(result_df, args.output)
     print(f"\n[*] Results saved to {args.output}")
 
@@ -300,7 +338,7 @@ def enumerate_macs(pcap_path):
     return rows
 
 
-def predict_and_aggregate(
+def predict_ml_and_aggregate(
     df,
     model,
     scaler,
@@ -348,17 +386,74 @@ def predict_and_aggregate(
     )
 
     summary = {
-        "status": "ok",
-        "window_count": len(df),
-        "predicted_type": most_common(pred_labels),
-        "camera_prob_mean": camera_prob_mean,
-        "camera_prob_max": camera_prob_max,
-        "camera_window_ratio": camera_window_ratio,
-        "camera_pred_windows": int(camera_window_mask.sum()),
-        "suspicious_camera": suspicious,
+        "ml_predicted_type": most_common(pred_labels),
+        "ml_camera_prob_mean": camera_prob_mean,
+        "ml_camera_prob_max": camera_prob_max,
+        "ml_camera_window_ratio": camera_window_ratio,
+        "ml_camera_pred_windows": int(camera_window_mask.sum()),
+        "ml_suspicious_camera": suspicious,
     }
-    summary.update(key_feature_means(df))
     return summary
+
+
+def predict_rule_and_aggregate(df, rule_threshold, rule_window_ratio_threshold):
+    predictions, scored = predict_dataframe(df, threshold=rule_threshold)
+    rule_window_ratio = float(predictions.mean()) if len(predictions) else 0.0
+    rule_score_mean = float(scored["rule_score"].mean()) if not scored.empty else 0.0
+    rule_score_max = float(scored["rule_score"].max()) if not scored.empty else 0.0
+
+    triggered = []
+    for item in scored.get("triggered_rules", []):
+        if not item:
+            continue
+        triggered.extend(str(item).split(";"))
+    common_rules = most_common_list(triggered, top_n=5)
+    suspicious = rule_window_ratio >= rule_window_ratio_threshold
+
+    return {
+        "rule_score_mean": rule_score_mean,
+        "rule_score_max": rule_score_max,
+        "rule_camera_window_ratio": rule_window_ratio,
+        "rule_camera_pred_windows": int(predictions.sum()),
+        "rule_suspicious_camera": suspicious,
+        "rule_common_triggers": ";".join(common_rules),
+    }
+
+
+def _combined_suspicious(summary, use_ml, use_rule):
+    flags = []
+    if use_ml:
+        flags.append(bool(summary.get("ml_suspicious_camera", False)))
+    if use_rule:
+        flags.append(bool(summary.get("rule_suspicious_camera", False)))
+    return any(flags)
+
+
+def print_candidate_result(summary, use_ml, use_rule, flag):
+    parts = [f"windows={summary['window_count']}"]
+    if use_ml:
+        parts.extend([
+            f"ml_prob_mean={summary['ml_camera_prob_mean']:.3f}",
+            f"ml_window_ratio={summary['ml_camera_window_ratio']:.3f}",
+        ])
+    if use_rule:
+        parts.extend([
+            f"rule_score_mean={summary['rule_score_mean']:.2f}",
+            f"rule_window_ratio={summary['rule_camera_window_ratio']:.3f}",
+        ])
+    parts.append(f"suspicious={flag}")
+    print("    " + "  ".join(parts))
+
+
+def sort_results(result_df, method):
+    columns = ["suspicious_camera"]
+    if method in ("ml", "both"):
+        columns.extend(["ml_camera_prob_mean", "ml_camera_window_ratio"])
+    if method in ("rule", "both"):
+        columns.extend(["rule_camera_window_ratio", "rule_score_mean"])
+    columns.extend(["data_source_frames", "total_frames"])
+    columns = [col for col in columns if col in result_df.columns]
+    return result_df.sort_values(columns, ascending=[False] * len(columns))
 
 
 def key_feature_means(df):
@@ -386,7 +481,7 @@ def key_feature_means(df):
     return output
 
 
-def print_summary(result_df):
+def print_summary(result_df, method):
     print("\n" + "=" * 72)
     print("UNKNOWN PCAP DETECTION SUMMARY")
     print("=" * 72)
@@ -397,11 +492,23 @@ def print_summary(result_df):
         "source_frames",
         "data_source_frames",
         "window_count",
-        "camera_prob_mean",
-        "camera_prob_max",
-        "camera_window_ratio",
-        "suspicious_camera",
     ]
+    if method in ("ml", "both"):
+        cols.extend([
+            "ml_camera_prob_mean",
+            "ml_camera_prob_max",
+            "ml_camera_window_ratio",
+            "ml_suspicious_camera",
+        ])
+    if method in ("rule", "both"):
+        cols.extend([
+            "rule_score_mean",
+            "rule_score_max",
+            "rule_camera_window_ratio",
+            "rule_suspicious_camera",
+            "rule_common_triggers",
+        ])
+    cols.append("suspicious_camera")
     cols = [col for col in cols if col in result_df.columns]
     print(result_df[cols].to_string(index=False))
 
@@ -412,10 +519,13 @@ def print_summary(result_df):
 
     print("\n[!] Suspicious camera MACs:")
     for _, row in suspicious.iterrows():
-        print(
-            f"    {row['mac']}  prob_mean={row['camera_prob_mean']:.3f}  "
-            f"windows={int(row['camera_pred_windows'])}/{int(row['window_count'])}"
-        )
+        parts = [f"    {row['mac']}"]
+        if method in ("ml", "both") and "ml_camera_prob_mean" in row:
+            parts.append(f"ml_prob_mean={row['ml_camera_prob_mean']:.3f}")
+        if method in ("rule", "both") and "rule_score_mean" in row:
+            parts.append(f"rule_score_mean={row['rule_score_mean']:.2f}")
+        parts.append(f"windows={int(row['window_count'])}")
+        print("  ".join(parts))
 
 
 def find_camera_label_index(label_names):
@@ -470,6 +580,17 @@ def most_common(values):
     if not counts:
         return "unknown"
     return max(counts.items(), key=lambda item: item[1])[0]
+
+
+def most_common_list(values, top_n=5):
+    counts = {}
+    for value in values:
+        counts[value] = counts.get(value, 0) + 1
+    return [
+        value for value, _ in sorted(
+            counts.items(), key=lambda item: item[1], reverse=True
+        )[:top_n]
+    ]
 
 
 def _warn_if_risky_features(feature_names):

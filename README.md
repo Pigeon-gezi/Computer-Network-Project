@@ -1,342 +1,384 @@
-# 802.11 MAC 层分析与设备识别
+# 基于 802.11 空口帧特性的无线摄像头检测系统
 
-> 计算机网络 CS3611 大作业 · 题目四 · 完整 AI 方案 (25分)
+本仓库是计算机网络课程大作业“基于空口帧特性识别的摄像头检测系统”的实现。系统通过外置 WiFi 网卡的 Monitor 模式被动抓取 802.11 空口帧，解析 Radiotap 与 MAC 层字段，按 MAC 地址聚合设备级流量画像，并用规则方法和机器学习方法识别疑似无线摄像头。
 
-## 项目简介
+## 功能概览
 
-本项目通过 **Monitor 模式** 抓取 802.11 WiFi 帧，解析 Radiotap + MAC 头部字段，提取多层级流量特征，使用 **SVM + Random Forest 集成模型** 对无线设备进行分类识别。重点应用场景为**隐藏无线摄像头检测**。
+- 空口帧采集：支持 Monitor 模式、固定信道、固定时长抓包，输出 `.pcap` 原始数据。
+- 字段解析与特征提取：提取源/目的 MAC、ToDS/FromDS、RSSI、速率、信道、帧长、帧类型、QoS、重传、加密标志等字段。
+- MAC 级画像：推荐使用 `device-window` 模式，以“一个 MAC 在一个时间窗口内的统计画像”为一条样本。
+- 规则判定 baseline：基于上行占比、长帧比例、QoS 比例、吞吐率、突发性等规则打分，并输出混淆矩阵。
+- AI 分类：支持 SVM、RandomForest 和集成模型，提供二分类摄像头检测与多分类设备识别。
+- 未知场景检测：对未标注 pcap 自动枚举候选 MAC，逐个建立 MAC 画像，输出疑似摄像头 MAC 排名。
+- 实验审计：提供泄露检查脚本，检查身份字段、时间字段、session 划分和单特征过强问题。
 
-### 技术栈
+## 项目结构
 
-- **抓包**: tshark / aircrack-ng (Linux, Monitor 模式 WiFi 网卡)
-- **解析**: PyShark + scapy
-- **ML**: scikit-learn (SVM, Random Forest, VotingClassifier)
-- **可视化**: matplotlib + seaborn
-- **语言**: Python 3
-
-### 参考文献
-
-- Liu T, et al. *Detecting wireless spy cameras via stimulating and probing.* MobiSys 2018.
-- Zhang X, et al. *CamLoPA: A hidden wireless camera localization framework via signal propagation path analysis.* IEEE S&P 2025.
-
----
-
-## 项目架构
-
-```bash
-project/
-├── README.md
-├── requirements.txt                  # Python 依赖
-├── capture_setup.sh                  # Monitor 模式 + 抓包 一键脚本
-│
+```text
+.
+├── scripts/
+│   ├── capture_monitor.sh          # Monitor mode + 信道锁定 + tshark 抓包
+│   ├── label_capture.py            # 从 pcap 中辅助选择 MAC 并写入 labels.csv
+│   ├── extract_features.py         # flow / device-window 特征提取
+│   ├── train_model.py              # SVM/RF/Ensemble 训练
+│   ├── evaluate_model.py           # AI 模型评估与图表生成
+│   ├── evaluate_rules.py           # 规则 baseline 评估
+│   ├── detect_unknown_pcap.py      # 未标注 pcap 的 MAC 级摄像头检测
+│   └── audit_leakage.py            # 数据泄露与划分审计
+├── src/
+│   ├── parser/                     # pcap、Radiotap、802.11 MAC 字段解析
+│   ├── features/                   # 帧级、flow 级、MAC-window 级特征
+│   ├── ml/                         # Dataset、SVM、RF、规则 baseline、评估、持久化
+│   └── visualization/              # 混淆矩阵、ROC/PR、特征图、PCA 等图表
 ├── data/
-│   ├── raw/                          # 原始 pcap 文件
-│   ├── processed/                    # 提取的特征 CSV + 评估结果 JSON
-│   ├── models/                       # 训练好的模型 (.joblib) + 元数据
-│   └── labels.csv                    # 设备 MAC -> 类型 标签 (训练用)
-│
-├── src/                              # 核心源代码
-│   ├── capture/                      # [层1] 抓包
-│   │   ├── monitor_setup.py          #   WiFi 网卡检测, Monitor 模式切换, 信道锁定
-│   │   └── capture_session.py        #   tshark 封装: 定时/定包/实时回调/字段批量导出
-│   │
-│   ├── parser/                       # [层2] 报文解析
-│   │   ├── pcap_reader.py            #   PyShark / tshark JSON 双后端解析, FrameInfo 数据结构
-│   │   ├── radiotap_parser.py        #   Radiotap 头: RSSI, data_rate, channel, MCS, 距离估算
-│   │   └── mac_frame_parser.py       #   802.11 MAC 帧: ToDS/FromDS 地址解析, 帧类型/子类型, QoS
-│   │
-│   ├── features/                     # [层3] 特征工程
-│   │   ├── per_frame_features.py     #   帧级特征: size, RSSI, type, flags, OUI (20+ 维)
-│   │   ├── per_flow_features.py      #   流级特征: IAT 统计, 方向比, RSSI 方差, 摄像头启发式评分
-│   │   ├── burst_detector.py         #   突发检测: 基于 IAT 阈值的突发识别 + 摄像头模式匹配
-│   │   ├── feature_selector.py       #   特征重要性排序 (RF Gini), PCA 降维, 摄像头特征集
-│   │   └── feature_extractor.py      #   总调度器: pcap → 三级特征 (帧/流/窗口) → DataFrame
-│   │
-│   ├── ml/                           # [层4] 机器学习
-│   │   ├── dataset.py                #   数据集构建: 标准化, 标签编码, 训练/测试拆分
-│   │   ├── svm_classifier.py         #   SVM: RBF/poly kernel, GridSearchCV (C, gamma)
-│   │   ├── rf_classifier.py          #   RF: n_estimators, max_depth 网格搜索
-│   │   ├── model_evaluator.py        #   评估: 混淆矩阵, F1/Precision/Recall, ROC AUC, 二分类检测
-│   │   ├── model_persistence.py      #   模型/定标器/元数据 保存与加载 (joblib + JSON)
-│   │   └── ensemble.py               #   集成: VotingClassifier soft voting, 权重优化
-│   │
-│   └── visualization/                # [层5] 可视化
-│       ├── frame_plots.py            #   帧类型饼图, 大小/RSSI/速率分布直方图, 信道使用
-│       ├── traffic_plots.py          #   吞吐量/包率时序图, 突发时间线, RSSI 时序+趋势
-│       ├── feature_plots.py          #   特征相关热力图, PCA 散点图, 特征重要性条形图
-│       └── result_plots.py           #   混淆矩阵 (原始+归一化), ROC 曲线, PR 曲线, 检测摘要
-│
-├── scripts/                          # CLI 入口脚本
-│   ├── collect_training_data.py      #   引导式数据采集 (按设备类型标注)
-│   ├── extract_features.py           #   特征提取 (单文件/批量, 支持 labels.csv)
-│   ├── train_model.py                #   模型训练 (多分类/二分类, 自动选择最佳模型)
-│   ├── run_detector.py               #   设备检测 (pcap/特征输入, 摄像头告警)
-│   └── evaluate_model.py             #   完整评估 + 图表报告生成
-│
-└── tests/                            # 单元测试 (53 个)
-    ├── test_pcap_reader.py           #   FrameInfo 数据结构 + PcapReader
-    ├── test_radiotap_parser.py       #   RadiotapFields + CSV 解析
-    ├── test_burst_detector.py        #   突发检测 + 摄像头模式识别
-    ├── test_feature_extractor.py     #   帧级/流级特征 + 摄像头启发式
-    └── test_ml_pipeline.py           #   Dataset, SVM, RF, Ensemble, 评估, 持久化
+│   ├── raw/                        # 原始 pcap，默认不进 Git
+│   ├── processed/                  # 特征 CSV，默认不进 Git
+│   └── models/                     # 模型文件，默认不进 Git
+├── report/                         # 评估图表与报告输出
+├── tests/                          # 单元测试
+├── VMWARE_UBUNTU_SETUP.md          # VMware + Ubuntu + 网卡抓包操作手册
+└── Task_clean.md                   # 任务要求文本
 ```
 
-### 数据流
+## 环境要求
 
-```
-WiFi Monitor 模式
-       │
-       ▼
-┌──────────────┐    ┌──────────────────┐    ┌─────────────────────┐
-│ tshark 抓包  │───▶│ PyShark 逐帧解析  │───▶│ 三级特征提取         │
-│ → .pcap 文件 │    │ Radiotap + MAC   │    │ 帧级 → 流级 → 窗口级 │
-└──────────────┘    └──────────────────┘    └──────────┬──────────┘
-                                                       │
-                                                       ▼
-┌──────────────────┐    ┌──────────────────┐    ┌──────────────┐
-│ 设备类型标签     │◀───│ Ensemble 投票     │◀───│ StandardScaler│
-│ camera/phone/.. │    │ SVM + RF (soft)   │    │ 特征标准化    │
-└──────────────────┘    └──────────────────┘    └──────────────┘
-```
+抓包必须在 Linux 环境中进行，推荐 Ubuntu 22.04 虚拟机加支持 Monitor 模式的 USB WiFi 网卡。Windows/WSL 通常不能完成真实 802.11 Monitor 抓包。
 
----
-
-## 特征体系
-
-### 帧级特征 (20+ 维)
-
-从每一帧 802.11 报文中提取:
-
-| 特征 | 来源 | 用途 |
-|------|------|------|
-| `rssi` | radiotap.dbm_antsignal | 信号强度 (dBm) |
-| `data_rate` | radiotap.datarate | PHY 速率 (Mbps) |
-| `channel_freq` | radiotap.channel.freq | 2.4/5 GHz 判断 |
-| `mcs_index` | radiotap.mcs.index | MCS 速率等级 |
-| `frame_len` | frame.len | 帧大小 (视频帧 ~1400B) |
-| `frame_type` | wlan.fc.type | 管理/控制/数据 |
-| `frame_subtype` | wlan.fc.type_subtype | QoS Data / Beacon / ACK |
-| `to_ds / from_ds` | wlan.fc | 方向 (上行/下行) |
-| `seq_num` | wlan.seq | 序列号 (连续→突发) |
-| `retry / protected` | wlan.fc | 重传/加密标志 |
-| `qos_priority` | wlan.qos.priority | QoS 优先级 (视频=高) |
-| `sa_oui` | wlan.sa 前三字节 | 厂商指纹 |
-
-### 流级特征 (按 SA→DA 聚合)
-
-| 类别 | 关键特征 |
-|------|---------|
-| **帧大小** | mean/std/min/max/median, large_frame_ratio |
-| **到达间隔 (IAT)** | mean/std/cv_iat, 规律性指标 |
-| **方向** | uplink_ratio (摄像头 ~0.9+) |
-| **信号** | mean/std/rssi_range/rssi_trend |
-| **帧类型** | data/mgmt/ctrl ratio, qos_data_ratio |
-| **加密/重传** | protected_ratio, retry_ratio |
-| **吞吐量** | throughput_bps, packet_count, total_bytes |
-
-### 突发特征 (核心创新点)
-
-基于 Liu et al. (MobiSys 2018) 的流量突发检测算法:
-
-```
-IAT < 1ms 的连续帧 → 突发
-突发特征: 数量 / 平均包数 / 大小 / 间隔 / 规律性(CV) / 密度
-```
-
-摄像头典型模式: 规律突发 (~33ms 间隔), 高密度, 大 I-frame 突发
-
----
-
-## 设备分类体系
-
-| 类别 | 典型 MAC 行为 | 关键区分特征 |
-|------|-------------|------------|
-| `wireless_camera` | 持续 QoS Data 上行, 大帧, 规律 IAT | large_frame_ratio↑, uplink_ratio↑, burst_regularity↓, qos_data_ratio↑ |
-| `smartphone` | 混合流量, Probe Request, RSSI 方差大 | mgmt_frame_ratio↑, rssi_variance↑, burst_regularity↑ |
-| `laptop` | 突发流量, 高总量 | throughput↑, packet_count↑, mean_frame_size 中等 |
-| `iot_sensor` | 低频小帧, 长休眠 | packet_count↓, mean_frame_size↓, burst_count↓ |
-| `access_point` | Beacon 主导, Management 为主 | mgmt_frame_ratio↑↑, data_frame_ratio↓ |
-
----
-
-## 使用流程
-
-### 环境准备
+系统依赖：
 
 ```bash
-# 安装系统依赖 (Ubuntu/Debian)
-sudo apt install tshark aircrack-ng wireless-tools
-
-# 安装 Python 依赖
-pip install -r requirements.txt
-
-# 验证 Monitor 模式支持
-python scripts/collect_training_data.py --detect
+sudo apt update
+sudo apt install -y python3 python3-pip git tshark aircrack-ng wireless-tools net-tools
 ```
 
-### 第一步: 采集训练数据
-
-为每种设备类型采集 5-10 分钟流量:
+Python 依赖：
 
 ```bash
-# 确保 WiFi 网卡处于 Monitor 模式
-sudo bash capture_setup.sh wlan0
-
-# 分别采集不同设备
-python scripts/collect_training_data.py \
-    -i wlan0mon -d wireless_camera -t 300 \
-    -n "手机IP摄像头模式, 720p流"
-
-python scripts/collect_training_data.py \
-    -i wlan0mon -d smartphone -t 300 \
-    -n "日常手机使用"
-
-python scripts/collect_training_data.py \
-    -i wlan0mon -d laptop -t 300 \
-    -n "笔记本网页浏览"
-
-# 查看已采集的会话
-python scripts/collect_training_data.py --list
+pip3 install -r requirements.txt
 ```
 
-### 第二步: 特征提取
+详细虚拟机和网卡配置见 [VMWARE_UBUNTU_SETUP.md](VMWARE_UBUNTU_SETUP.md)。
+
+## 推荐工作流
+
+### 1. 抓包
+
+示例接口名为 `wlx6c1ff790462a`，信道以实际热点信道为准：
 
 ```bash
-# 批量提取所有 pcap 的特征 (与标签关联)
-python scripts/extract_features.py \
-    -d data/raw/ \
-    -l data/labels.csv \
-    -o data/processed/features.csv
-
-# 或对单个文件提取
-python scripts/extract_features.py \
-    -i data/raw/camera_20240101_120000.pcap \
-    -o data/processed/camera_features.csv
+bash scripts/capture_monitor.sh \
+  -i wlx6c1ff790462a \
+  -o data/raw/train/wireless_camera_001.pcap \
+  -t 60 \
+  -c 6
 ```
 
-### 第三步: 训练模型
+建议目录：
+
+```text
+data/raw/train/        干净训练 session
+data/raw/test/         独立 final test session
+data/raw/mixed_test/   未标注混合场景，用于演示检测
+data/raw/scratch/      临时抓包
+```
+
+### 2. 标注目标 MAC
+
+训练和测试集的 `device-window` 特征需要知道每份 pcap 的目标设备 MAC：
 
 ```bash
-# 多分类模式 (识别所有设备类型)
-python scripts/train_model.py \
-    -f data/processed/features.csv \
-    -o data/models/
-
-# 二分类模式 (仅检测摄像头 vs 非摄像头)
-python scripts/train_model.py \
-    -f data/processed/features.csv \
-    -o data/models/ \
-    --binary-camera
+python3 scripts/label_capture.py \
+  -p data/raw/train/wireless_camera_001.pcap \
+  -d wireless_camera \
+  -n "camera live view"
 ```
 
-### 第四步: 运行检测
+`data/labels.csv` 格式：
+
+```csv
+device_mac,device_type,session_id,notes,timestamp
+aa:bb:cc:dd:ee:ff,wireless_camera,wireless_camera_001,camera live view,2026-06-18T10:00:00
+11:22:33:44:55:66,tablet,tablet_001,tablet streaming,2026-06-18T10:10:00
+```
+
+`session_id` 使用文件名前缀匹配。比如 `wireless_camera_001` 会匹配 `wireless_camera_001.pcap`。
+
+### 3. 提取 MAC-window 特征
+
+训练集：
 
 ```bash
-# 对未知 pcap 文件进行设备识别
-python scripts/run_detector.py \
-    -p data/raw/unknown_capture.pcap \
-    -m data/models/
-
-# 摄像头专项检测 (二分类)
-python scripts/run_detector.py \
-    -p data/raw/unknown_capture.pcap \
-    -m data/models/ \
-    --binary-detection \
-    --min-confidence 0.6
-
-# 使用预提取的特征
-python scripts/run_detector.py \
-    -f data/processed/unknown_features.csv \
-    -m data/models/
+python3 scripts/extract_features.py \
+  -d data/raw/train \
+  -l data/labels.csv \
+  -o data/processed/train_device_window_features.csv \
+  --level device-window \
+  --window 10
 ```
 
-### 第五步: 评估 & 报告
+测试集：
 
 ```bash
-# 生成完整评估报告和图表
-python scripts/evaluate_model.py \
-    -f data/processed/features.csv \
-    -m data/models/ \
-    -o report/figures/ \
-    --report
-
-# 二分类评估
-python scripts/evaluate_model.py \
-    -f data/processed/features.csv \
-    -m data/models/ \
-    --binary
+python3 scripts/extract_features.py \
+  -d data/raw/test \
+  -l data/labels.csv \
+  -o data/processed/test_device_window_features.csv \
+  --level device-window \
+  --window 10
 ```
 
-### 运行测试
+`--window` 可以按实验需要调整。窗口越短样本越多，但单条画像更噪；窗口越长画像更稳定，但样本更少。
+
+### 4. 数据审计
+
+训练前建议检查是否存在身份泄露、时间泄露或同一 pcap 的窗口被拆到训练和测试两边：
 
 ```bash
-python -m pytest tests/ -v                    # 全部 53 个测试
-python -m pytest tests/ -v -k "burst"         # 仅突发检测相关
-python -m pytest tests/ -v -k "ml"            # 仅 ML 流水线
+python3 scripts/audit_leakage.py \
+  -f data/processed/train_device_window_features.csv \
+  --positive-label wireless_camera \
+  --group-col source_file
 ```
 
----
+重点关注：
 
-## 注意事项
+- `device_mac`、`device_oui`、`source_file` 不应进入模型特征。
+- `window_idx`、`window_start`、`camera_heuristic_score` 不应进入模型特征。
+- 使用 `--group-col source_file` 时，同一个 pcap 不应同时出现在 train/test。
 
-### 硬件要求
+### 5. 训练 AI 模型
 
-- **必须**拥有一块支持 Monitor 模式的 WiFi 网卡
-- **必须**在 Linux 环境下运行 (Windows WSL2 不支持 Monitor 模式)
-- 推荐网卡芯片: Atheros AR9271, Ralink RT3070, Realtek RTL8812AU, Intel AX200 (部分支持)
+推荐训练二分类摄像头检测器，并按 pcap 文件分组划分内部验证集：
 
-### 环境要求
+```bash
+python3 scripts/train_model.py \
+  -f data/processed/train_device_window_features.csv \
+  -o data/models \
+  --binary-camera \
+  --cv 2 \
+  --group-col source_file
+```
 
-- `tshark` 需要 root 权限才能抓包, 所有涉及抓包的命令都需要 `sudo`
-- 首次使用 Wireshark/tshark 时可能需要配置: `sudo dpkg-reconfigure wireshark-common` 并允许非 root 用户抓包
+实现中默认排除了身份字段、时间字段和规则分数字段，避免模型直接学习 MAC、OUI、文件名或人工规则分数。
 
-### 数据采集建议
+### 6. 评估 AI 模型
 
-- **设备距离**: 保持目标设备距抓包网卡 2-5 米, 避免信号过强饱和
-- **环境控制**: 尽量在 WiFi 干扰较小的环境采集, 关闭不必要的 WiFi 设备
-- **信道固定**: 建议锁定到目标 AP 所在信道 (`-c` 参数), 避免跳频丢失帧
-- **标签准确性**: 确保 `labels.csv` 中的 session_id 与 pcap 文件名前缀匹配
+独立测试集评估：
 
-### 摄像头模拟方案
+```bash
+python3 scripts/evaluate_model.py \
+  -f data/processed/test_device_window_features.csv \
+  -m data/models \
+  --binary \
+  --external-test \
+  -o report/final_device_window_test
+```
 
-如果没有真实无线摄像头, 可使用以下替代方案:
+输出包括混淆矩阵、归一化混淆矩阵、ROC 曲线、PR 曲线、PCA 图、特征重要性图和评估 JSON。
 
-1. **手机 IP 摄像头**: Android 安装 "IP Webcam" APP, iPhone 使用 "EpocCam"
-2. **ESP32-CAM**: 低成本 WiFi 摄像头模块 (~30元)
-3. **笔记本摄像头推流**: 使用 `ffmpeg` 将摄像头推流到本地 RTMP 服务器
-4. **公开数据集**: 搜索 "802.11 wireless camera pcap dataset"
+### 7. 评估规则 baseline
 
-### 模型性能说明
+规则法用于满足基础任务中的“建立判决依据”，也用于与 AI 模型对比：
 
-- 数据集越大越平衡, 模型效果越好 (建议每种设备 >5 分钟流量)
-- 不同环境下的 WiFi 特征可能有分布偏移, 建议在目标环境中采集训练数据
-- RF 输出的特征重要性可用于报告的实验分析章节
+```bash
+python3 scripts/evaluate_rules.py \
+  -f data/processed/test_device_window_features.csv \
+  -o report/rule_baseline_test \
+  --positive-label wireless_camera \
+  --threshold 5
+```
 
-### 常见问题
+规则分数依据包括：
 
-| 问题 | 解决方法 |
-|------|---------|
-| `tshark: No such device` | 检查网卡名: `iw dev` 或 `iwconfig` |
-| `Permission denied` | 需要 `sudo` 运行 tshark 抓包命令 |
-| 特征提取后 DataFrame 为空 | 检查 pcap 是否包含 802.11 帧 (非以太网帧) |
-| RSSI 字段缺失 | 不同驱动报告不同 radiotap 字段, 代码已做优雅降级 |
-| PyShark 导入报错 | 检查 tshark 是否正确安装: `tshark --version` |
-| 训练准确率低 | 增加训练数据量, 检查设备标签是否正确, 调整 `--cv` 参数 |
+- 发送包占比高
+- 上行包占比高
+- 长帧比例高
+- QoS 数据帧比例高
+- 包间隔相对稳定
+- burst 数量较多
+- 吞吐率较高
 
----
+输出包括 `rule_predictions.csv`、`rules.csv`、`rule_metrics.json`、规则法混淆矩阵和归一化混淆矩阵。
 
-## 评分对应
+### 8. 未知 pcap 现场检测
 
-| 评分项 | 对应实现 | 分值 |
-|--------|---------|------|
-| Monitor 抓包 + pcap 分析 | `capture/` + `parser/` 层 | 基础 15分 |
-| RSSI 分析 + 设备识别 | `features/` 流级特征 + RSSI 统计 | 进阶 +10分 |
-| SVM/RF 设备分类 | `ml/` 集成模型 + GridSearchCV 调参 | AI +25分 |
-| 可视化 + 报告 | `visualization/` + `scripts/evaluate_model.py` | 完整呈现 |
-| 测试覆盖 | `tests/` 53 个单元测试 | 代码质量保证 |
+对未标注混合 pcap 自动枚举 MAC 并输出疑似摄像头。支持三种方法：
 
----
+ML 模型检测：
+```bash
+python3 scripts/detect_unknown_pcap.py \
+  -p data/raw/mixed_test/unknown_scene.pcap \
+  --method ml \
+  -m data/models \
+  --window 10 \
+  --top-macs 20 \
+  --min-frames 100 \
+  --min-source-frames 10 \
+  --camera-threshold 0.6 \
+  -o data/processed/unknown_scene_detection.csv
+```
+
+规则 baseline 检测，不需要模型目录：
+
+```bash
+python3 scripts/detect_unknown_pcap.py \
+  -p data/raw/mixed_test/unknown_scene.pcap \
+  --method rule \
+  --window 10 \
+  --top-macs 20 \
+  --min-frames 100 \
+  --min-source-frames 10 \
+  --rule-threshold 5 \
+  --rule-window-ratio-threshold 0.5 \
+  -o data/processed/unknown_scene_rule_detection.csv
+```
+
+同时输出 ML 与规则结果：
+
+```bash
+python3 scripts/detect_unknown_pcap.py \
+  -p data/raw/mixed_test/unknown_scene.pcap \
+  --method both \
+  -m data/models \
+  --window 10 \
+  --top-macs 20 \
+  --camera-threshold 0.6 \
+  --rule-threshold 5 \
+  -o data/processed/unknown_scene_both_detection.csv
+```
+
+输出字段包括：
+
+```text
+mac
+total_frames
+source_frames
+data_source_frames
+window_count
+ml_camera_prob_mean / rule_score_mean
+ml_camera_window_ratio / rule_camera_window_ratio
+suspicious_camera
+关键特征均值
+```
+
+ML 模式下，`ml_camera_prob_mean` 是该 MAC 多个窗口的平均摄像头概率；`ml_camera_window_ratio` 是被模型判为摄像头的窗口占比。规则模式下，`rule_score_mean` 是平均规则分数；`rule_camera_window_ratio` 是规则判为摄像头的窗口占比。`suspicious_camera` 会综合当前启用方法的结果，偏向候选发现而不是最终定罪。
+
+## 关键实现说明
+
+### 为什么采用 MAC-level device-window
+
+任务要求“按 MAC 地址进行聚合统计，形成设备级流量画像”。因此正式实验使用 `device-window`：每一行样本对应一个目标 MAC 在一个时间窗口内的统计特征，而不是一个 flow 或一整份 pcap。
+
+### 如何区分上下行
+
+代码使用 802.11 MAC 头中的 `ToDS/FromDS` 字段判断方向：
+
+```text
+ToDS=1, FromDS=0  -> STA 到 AP，视为上行
+ToDS=0, FromDS=1  -> AP 到 STA，视为下行
+```
+
+摄像头作为 WiFi STA 上传视频时，通常表现为持续的 STA->AP 数据帧。
+
+### 规则法和 AI 法的关系
+
+规则法是独立 baseline，不作为 AI 模型输入。`camera_heuristic_score`、`is_known_camera_oui` 等高风险字段已从训练特征中排除。这样可以在报告中公平比较：
+
+```text
+规则判定 baseline vs SVM vs RandomForest vs Ensemble
+```
+
+### 数据泄露控制
+
+当前训练流程做了以下控制：
+
+- 排除 `device_mac`、`device_oui`、`source_file`、`session_id` 等身份字段。
+- 排除 `window_idx`、`window_start` 等时间/位置字段。
+- 排除 `camera_heuristic_score` 和 `is_known_camera_oui`。
+- 通过 `--group-col source_file` 避免同一 pcap 的多个窗口同时进入训练集和内部测试集。
+- 提供 `audit_leakage.py` 检查单特征过强、身份字段和 split overlap。
+
+### AUC 与 F1 的区别
+
+AUC 衡量概率排序能力，F1 衡量固定决策阈值下的分类结果。因此可能出现 AUC 很高但 F1 下降的情况，说明模型排序较好，但当前阈值或决策边界不是最优。
+
+## 数据采集建议
+
+- 每类至少采集多个独立 pcap，尽量覆盖不同时间、位置、距离和信道条件。
+- 不要让类别和环境强绑定，例如不要只在热点 A 采摄像头、只在热点 B 采非摄像头。
+- 需要困难负样本：视频通话、直播推流、云盘上传、大文件上传等。
+- 需要困难正样本：低码率摄像头、画面静止、不同型号摄像头、不同距离和网络环境。
+- 单个 WiFi 网卡同一时刻只能监听一个信道，不能同时抓 2.4 GHz 和 5 GHz。
+- 手机作为热点时，热点手机自身通过蜂窝上传云盘不经过 WiFi 空口；应让另一台设备连接热点并上传。
+
+## 常用命令速查
+
+```bash
+# 抓包
+bash scripts/capture_monitor.sh -i wlx6c1ff790462a -o data/raw/test.pcap -t 60 -c 6
+
+# 查看 pcap 中源 MAC 排名
+tshark -r data/raw/test.pcap -Y "wlan.fc.type == 2" -T fields -e wlan.sa | sort | uniq -c | sort -nr | head
+
+# 标注
+python3 scripts/label_capture.py -p data/raw/train/camera_001.pcap -d wireless_camera
+
+# 提取 device-window 特征
+python3 scripts/extract_features.py -d data/raw/train -l data/labels.csv -o data/processed/train_device_window_features.csv --level device-window --window 10
+
+# 训练
+python3 scripts/train_model.py -f data/processed/train_device_window_features.csv -o data/models --binary-camera --cv 2 --group-col source_file
+
+# AI 评估
+python3 scripts/evaluate_model.py -f data/processed/test_device_window_features.csv -m data/models --binary --external-test -o report/final_device_window_test
+
+# 规则法评估
+python3 scripts/evaluate_rules.py -f data/processed/test_device_window_features.csv -o report/rule_baseline_test --positive-label wireless_camera --threshold 5
+
+# 未知 pcap 检测：ML
+python3 scripts/detect_unknown_pcap.py -p data/raw/mixed_test/unknown_scene.pcap --method ml -m data/models --window 10 --top-macs 20 -o data/processed/unknown_scene_detection.csv
+
+# 未知 pcap 检测：规则法
+python3 scripts/detect_unknown_pcap.py -p data/raw/mixed_test/unknown_scene.pcap --method rule --window 10 --top-macs 20 --rule-threshold 5 -o data/processed/unknown_scene_rule_detection.csv
+```
+
+## 测试
+
+```bash
+python -m pytest tests/ -v
+```
+
+测试覆盖解析、特征提取、burst 检测、机器学习管线、模型评估与持久化等基础逻辑。
+
+## Git 数据管理
+
+`.gitignore` 默认忽略：
+
+```text
+data/raw/*
+data/processed/*
+data/models/*
+*.pcap
+*.pcapng
+*.joblib
+__pycache__/
+*.pyc
+```
+
+大文件 pcap、特征 CSV 和训练模型建议保留在本地或云盘，不直接提交到 GitHub。
+
+## 任务要求对应关系
+
+| 任务要求 | 当前实现 |
+| --- | --- |
+| 空口帧获取 | `scripts/capture_monitor.sh`，支持 monitor mode、信道锁定、固定时长抓包 |
+| 字段分析 | `src/parser/` 与 `src/features/`，解析 Radiotap 与 802.11 MAC 字段 |
+| MAC 聚合画像 | `--level device-window`，按 MAC 与时间窗口聚合 |
+| 规则判决 | `src/ml/rule_baseline.py` 与 `scripts/evaluate_rules.py` |
+| 指标评估 | `scripts/evaluate_model.py`、`scripts/evaluate_rules.py` 输出混淆矩阵、F1、误报率、漏报率 |
+| AI 扩展 | SVM、RandomForest、Ensemble 摄像头检测 |
+| 现场演示 | `scripts/detect_unknown_pcap.py` 对未知 pcap 输出候选摄像头 MAC |
 
 ## 许可证
 
-本项目为课程作业, 仅供学习参考。
+本项目为课程作业，仅供学习与实验展示使用。

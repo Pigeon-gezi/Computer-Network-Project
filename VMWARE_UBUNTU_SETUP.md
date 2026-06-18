@@ -504,13 +504,14 @@ rule_confusion_matrix_norm.png     归一化混淆矩阵
 
 ### 未知 pcap 检测模式
 
-正式演示时更常见的输入是一份未标注的现场 pcap。此时不应该依赖 `labels.csv`，而是让程序枚举 pcap 中出现的 MAC，逐个建立 device-window 画像，再用训练好的 `camera_detector` 判断哪些 MAC 疑似摄像头。
+正式演示时更常见的输入是一份未标注的现场 pcap。此时不应该依赖 `labels.csv`，而是让程序枚举 pcap 中出现的 MAC，逐个建立 device-window 画像，再用训练好的 `camera_detector` 或规则 baseline 判断哪些 MAC 疑似摄像头。
 
-推荐使用：
+ML 模型检测：
 
 ```bash
 python3 scripts/detect_unknown_pcap.py \
   -p data/raw/mixed_test/unknown_scene.pcap \
+  --method ml \
   -m data/models \
   --window 10 \
   --top-macs 20 \
@@ -520,11 +521,40 @@ python3 scripts/detect_unknown_pcap.py \
   -o data/processed/unknown_scene_detection.csv
 ```
 
+规则 baseline 检测，不需要模型目录：
+
+```bash
+python3 scripts/detect_unknown_pcap.py \
+  -p data/raw/mixed_test/unknown_scene.pcap \
+  --method rule \
+  --window 10 \
+  --top-macs 20 \
+  --min-frames 100 \
+  --min-source-frames 10 \
+  --rule-threshold 5 \
+  --rule-window-ratio-threshold 0.5 \
+  -o data/processed/unknown_scene_rule_detection.csv
+```
+
+如果希望同一次输出 ML 和规则法结果：
+
+```bash
+python3 scripts/detect_unknown_pcap.py \
+  -p data/raw/mixed_test/unknown_scene.pcap \
+  --method both \
+  -m data/models \
+  --window 10 \
+  --top-macs 20 \
+  --camera-threshold 0.6 \
+  --rule-threshold 5 \
+  -o data/processed/unknown_scene_both_detection.csv
+```
+
 该脚本会输出：
 
 ```text
 1. pcap 中出现频率较高的候选 MAC
-2. 每个候选 MAC 的窗口数、帧数、摄像头概率
+2. 每个候选 MAC 的窗口数、帧数、ML 摄像头概率或规则分数
 3. 被判定为 suspicious_camera 的 MAC
 4. 关键指标均值，例如 large_frame_ratio、mean_frame_size、uplink_packet_ratio
 ```
@@ -546,7 +576,13 @@ python3 scripts/detect_unknown_pcap.py \
     真正的上行比例会在 device-window 特征中通过 uplink_packet_ratio 等字段计算。
 
 --camera-threshold 0.6
-    如果某个 MAC 的平均摄像头概率超过该阈值，则标记为 suspicious_camera。
+    ML 模式参数。如果某个 MAC 的平均摄像头概率超过该阈值，则标记为 ML suspicious。
+
+--rule-threshold 5
+    规则模式参数。如果某个 window 的规则分数超过该阈值，则该 window 被规则法判为 camera。
+
+--rule-window-ratio-threshold 0.5
+    规则模式参数。如果某个 MAC 中至少该比例的 window 被规则法判为 camera，则标记为 rule suspicious。
 ```
 
 如果抓包时间较短，候选 MAC 被过滤掉，可以适当放宽：
@@ -554,6 +590,7 @@ python3 scripts/detect_unknown_pcap.py \
 ```bash
 python3 scripts/detect_unknown_pcap.py \
   -p data/raw/mixed_test/unknown_scene.pcap \
+  --method ml \
   -m data/models \
   --top-macs 0 \
   --min-frames 30 \
@@ -566,6 +603,7 @@ python3 scripts/detect_unknown_pcap.py \
 ```bash
 python3 scripts/detect_unknown_pcap.py \
   -p data/raw/mixed_test/unknown_scene.pcap \
+  --method ml \
   -m data/models \
   --top-macs 10 \
   --min-frames 500 \
